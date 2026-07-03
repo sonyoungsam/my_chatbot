@@ -4,6 +4,14 @@ from openai import OpenAI
 LLM_BASE_URL = "http://192.168.0.201:18000/v1"
 LLM_MODEL = "Qwen/Qwen3.6-35B-A3B-FP8"
 
+DEFAULT_SYSTEM_PROMPT = """You are a helpful, honest assistant.
+
+- If you do not know the answer, or are not confident, say so plainly instead of guessing.
+- Never invent facts, sources, numbers, or events. If information may be outdated or you are unsure, say so explicitly.
+- Only answer based on what is actually known or given in the conversation. Do not go off-topic or answer a question that was not asked.
+- If a question is ambiguous, ask a clarifying question instead of assuming.
+- Keep answers concise and directly relevant to the user's question."""
+
 
 def _partial_tag_len(text: str, tag: str) -> int:
     """text 끝부분이 tag의 앞부분과 겹치는 길이를 반환한다 (청크 경계에서 태그가 잘리는 경우 대비)."""
@@ -18,13 +26,13 @@ st.title("My First Chat Bot")
 
 with st.sidebar:
     st.header("LLM 옵션")
-    temperature = st.slider("Temperature", min_value=0.0, max_value=2.0, value=0.7, step=0.05)
-    top_p = st.slider("Top P", min_value=0.0, max_value=1.0, value=1.0, step=0.05)
+    temperature = st.slider("Temperature", min_value=0.0, max_value=2.0, value=0.3, step=0.05)
+    top_p = st.slider("Top P", min_value=0.0, max_value=1.0, value=0.9, step=0.05)
     max_tokens = st.slider("Max output tokens", min_value=64, max_value=8192, value=1024, step=64)
     system_prompt = st.text_area(
         "System prompt",
-        value="You are a helpful assistant.",
-        height=100,
+        value=DEFAULT_SYSTEM_PROMPT,
+        height=200,
     )
 
     if st.button("대화 초기화"):
