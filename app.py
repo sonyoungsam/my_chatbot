@@ -1,3 +1,5 @@
+import uuid
+
 import streamlit as st
 from openai import OpenAI
 
@@ -12,6 +14,8 @@ DEFAULT_SYSTEM_PROMPT = """You are a helpful, honest assistant.
 - If a question is ambiguous, ask a clarifying question instead of assuming.
 - Keep answers concise and directly relevant to the user's question."""
 
+NEW_CHAT_TITLE = "새 대화"
+
 
 def _partial_tag_len(text: str, tag: str) -> int:
     """text 끝부분이 tag의 앞부분과 겹치는 길이를 반환한다 (청크 경계에서 태그가 잘리는 경우 대비)."""
@@ -20,9 +24,22 @@ def _partial_tag_len(text: str, tag: str) -> int:
             return length
     return 0
 
+
+def _new_conversation():
+    conv_id = str(uuid.uuid4())
+    st.session_state.conversations[conv_id] = {"title": NEW_CHAT_TITLE, "messages": []}
+    st.session_state.conversation_order.append(conv_id)
+    st.session_state.current_id = conv_id
+
+
 st.set_page_config(page_title="My First Chat Bot", page_icon="🤖", layout="wide")
 
 st.title("My First Chat Bot")
+
+if "conversations" not in st.session_state:
+    st.session_state.conversations = {}
+    st.session_state.conversation_order = []
+    _new_conversation()
 
 with st.sidebar:
     st.header("LLM 옵션")
@@ -35,30 +52,48 @@ with st.sidebar:
         height=200,
     )
 
-    if st.button("대화 초기화"):
-        st.session_state.messages = []
+    if st.button("🆕 새 대화", use_container_width=True):
+        _new_conversation()
         st.rerun()
 
     st.caption(f"Model: {LLM_MODEL}")
     st.caption(f"Endpoint: {LLM_BASE_URL}")
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+    st.divider()
+    st.subheader("대화 목록")
+    for conv_id in reversed(st.session_state.conversation_order):
+        conv = st.session_state.conversations[conv_id]
+        is_current = conv_id == st.session_state.current_id
+        icon = "💬" if is_current else "🗨️"
+        if st.button(
+            f"{icon} {conv['title']}",
+            key=f"conv_btn_{conv_id}",
+            use_container_width=True,
+            type="primary" if is_current else "secondary",
+        ):
+            st.session_state.current_id = conv_id
+            st.rerun()
+
+current_conv = st.session_state.conversations[st.session_state.current_id]
+messages = current_conv["messages"]
 
 client = OpenAI(base_url=LLM_BASE_URL, api_key="not-needed")
 
-for message in st.session_state.messages:
+for message in messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
 user_input = st.chat_input("메시지를 입력하세요...")
 
 if user_input:
-    st.session_state.messages.append({"role": "user", "content": user_input})
+    if current_conv["title"] == NEW_CHAT_TITLE:
+        current_conv["title"] = user_input[:30] + ("…" if len(user_input) > 30 else "")
+
+    messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    request_messages = [{"role": "system", "content": system_prompt}] + st.session_state.messages
+    request_messages = [{"role": "system", "content": system_prompt}] + messages
 
     with st.chat_message("assistant"):
         placeholder = st.empty()
@@ -110,4 +145,4 @@ if user_input:
             full_response = f"오류가 발생했습니다: {e}"
             placeholder.error(full_response)
 
-    st.session_state.messages.append({"role": "assistant", "content": full_response})
+    messages.append({"role": "assistant", "content": full_response})
