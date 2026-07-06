@@ -90,6 +90,25 @@ Local URL: http://localhost:8501
 
 브라우저가 자동으로 열리지 않으면 위 주소를 직접 입력해서 접속하세요.
 
+### 5. (Windows) 아이콘 더블클릭으로 실행하기
+
+매번 터미널을 열지 않아도 되도록 실행 파일과 바탕화면 아이콘을 만들어 두었습니다.
+
+- [run_chatbot.bat](run_chatbot.bat) — 더블클릭하면 가상환경 활성화 후 `streamlit run app.py` 를 자동 실행합니다. (최초 1회는 `venv`가 준비되어 있어야 합니다.)
+- 바탕화면의 **"My Chat Bot"** 바로가기 — [assets/icon.ico](assets/icon.ico) 아이콘을 사용하는 `run_chatbot.bat` 바로가기입니다.
+
+다른 PC에 새로 바로가기를 만들고 싶다면 PowerShell에서:
+
+```powershell
+$WshShell = New-Object -ComObject WScript.Shell
+$desktop = [Environment]::GetFolderPath("Desktop")
+$Shortcut = $WshShell.CreateShortcut("$desktop\My Chat Bot.lnk")
+$Shortcut.TargetPath = "<프로젝트 경로>\run_chatbot.bat"
+$Shortcut.WorkingDirectory = "<프로젝트 경로>"
+$Shortcut.IconLocation = "<프로젝트 경로>\assets\icon.ico"
+$Shortcut.Save()
+```
+
 ---
 
 ## ⚙️ 설정
