@@ -22,11 +22,20 @@ DEFAULT_SYSTEM_PROMPT = """You are a helpful, honest assistant.
 NEW_CHAT_TITLE = "새 대화"
 WEB_SEARCH_MAX_RESULTS = 5
 DEFAULT_WEATHER_LOCATION = "Seoul"
+NOMINATIM_USER_AGENT = "my-first-chat-bot/1.0 (personal streamlit weather feature)"
+WEATHER_FORECAST_DAYS = 14  # Open-Meteo 무료 플랜은 최대 16일까지 지원
 
 WEATHER_KEYWORDS = ["날씨", "기온", "체감온도", "강수", "비 와", "비와", "눈 와", "눈와", "우산", "습도", "풍속"]
-WEATHER_LOCATION_STOPWORDS = {
+
+# 위치 후보를 고를 때 제외할, 지역명이 아닌 흔한 단어들.
+WEATHER_SKIP_TOKENS = {
     "오늘", "내일", "모레", "지금", "현재", "이번주", "이번", "주말", "여기", "이곳", "저기", "거기", "요즘",
+    "알려줘", "알려주세요", "알려줄래", "어때", "어떄", "어떠니", "궁금해", "궁금합니다",
+    "좀", "정도", "관련", "정보", "얼마나", "말해줘", "말해주세요", "확인해줘", "확인해주세요",
 }
+
+# 지역명 뒤에 흔히 붙는 조사. 긴 것부터 검사해야 짧은 조사가 먼저 잘못 걸리지 않는다.
+KOREAN_PARTICLE_SUFFIXES = ("에서의", "에서", "에게", "으로", "부터", "까지", "의", "은", "는", "이", "가", "을", "를", "도", "에")
 
 # WMO Weather interpretation codes (open-meteo.com 기준)
 WMO_WEATHER_DESCRIPTIONS = {
@@ -79,49 +88,121 @@ def _looks_like_weather_query(text: str) -> bool:
     return any(keyword in text for keyword in WEATHER_KEYWORDS)
 
 
-def _extract_weather_location(text: str, default: str) -> str:
-    """'서울 날씨' 처럼 '날씨' 앞에 붙은 지역명을 뽑아낸다. 못 찾으면 기본 지역을 반환한다."""
-    match = re.search(r"([가-힣A-Za-z]{2,10}?)의?\s*(?:날씨|기온)", text)
-    if match:
-        candidate = match.group(1).strip()
-        if candidate and candidate not in WEATHER_LOCATION_STOPWORDS:
-            return candidate
-    return default
+def _strip_korean_particle(token: str) -> str:
+    """조사를 뗀다. "까지의"처럼 조사가 겹쳐 붙는 경우까지 대비해 최대 2번 반복한다."""
+    for _ in range(2):
+        for suffix in KOREAN_PARTICLE_SUFFIXES:
+            if len(token) > len(suffix) + 1 and token.endswith(suffix):
+                token = token[: -len(suffix)]
+                break
+        else:
+            break
+    return token
+
+
+def _weather_location_candidates(text: str, default: str):
+    """문장에서 지역명일 가능성이 있는 후보들을 순서대로 뽑아낸다.
+
+    한국어는 지역명 뒤에 조사('의', '은' 등)가 자유롭게 붙고, "송파구의 오늘
+    날씨"처럼 '날씨' 바로 앞이 아닌 곳에 지역명이 올 수도 있어서, 정규식으로
+    위치를 한 번에 콕 집어내려던 이전 방식은 "오늘"처럼 엉뚱한 단어를
+    뽑아내는 문제가 있었다. 대신 문장의 모든 단어에서 흔한 조사를 떼어낸 뒤,
+    지역명이 아닐 게 뻔한 단어만 걸러내고 나머지는 전부 후보로 남긴다.
+    실제로 어느 후보가 진짜 지역인지는 지오코딩 API가 검증하게 한다
+    (_fetch_weather_for_query 참고).
+    """
+    tokens = re.findall(r"[가-힣A-Za-z0-9]+", text)
+    candidates = []
+    for tok in tokens:
+        stripped = _strip_korean_particle(tok)
+        if len(stripped) < 2:
+            continue
+        if stripped in WEATHER_SKIP_TOKENS or "날씨" in stripped or "기온" in stripped:
+            continue
+        if stripped not in candidates:
+            candidates.append(stripped)
+    candidates.append(default)
+    return candidates
+
+
+def _geocode(location: str):
+    """Nominatim(OpenStreetMap, 무료·API 키 불필요)으로 지역명을 좌표로 변환한다.
+
+    Open-Meteo 자체 지오코딩은 "송파구" 같은 한국 구 단위 행정구역을 아예
+    데이터베이스에 갖고 있지 않거나("송파구" 검색 시 결과 0건), 같은 이름의
+    동네가 여러 나라에 있을 때 엉뚱한 나라를 1순위로 반환하는 문제(예: "문정동"
+    -> 북한 황해북도)가 있어 Nominatim으로 교체했다. Nominatim은 실제 주소/행정
+    경계 데이터라 "송파구", "문정동" 모두 정확히 서울로 찾는다.
+    """
+    resp = requests.get(
+        "https://nominatim.openstreetmap.org/search",
+        params={"q": location, "format": "json", "limit": 1, "accept-language": "ko"},
+        headers={"User-Agent": NOMINATIM_USER_AGENT},
+        timeout=6,
+    )
+    resp.raise_for_status()
+    results = resp.json()
+    return results[0] if results else None
 
 
 def _fetch_weather(location: str):
-    """Open-Meteo API(무료, API 키 불필요)로 실시간 날씨를 조회한다. 실패하면 None을 반환한다."""
+    """Nominatim으로 지오코딩 후 Open-Meteo로 실시간 날씨 + 시간대별 예보를 가져온다.
+
+    실패하면(지오코딩 실패, API 오류 등) None을 반환한다.
+    """
     try:
-        geo_resp = requests.get(
-            "https://geocoding-api.open-meteo.com/v1/search",
-            params={"name": location, "count": 1, "language": "ko", "format": "json"},
-            timeout=5,
-        )
-        geo_resp.raise_for_status()
-        geo_results = geo_resp.json().get("results")
-        if not geo_results:
+        place = _geocode(location)
+        if not place:
             return None
-        place = geo_results[0]
+        lat, lon = float(place["lat"]), float(place["lon"])
 
         weather_resp = requests.get(
             "https://api.open-meteo.com/v1/forecast",
             params={
-                "latitude": place["latitude"],
-                "longitude": place["longitude"],
+                "latitude": lat,
+                "longitude": lon,
                 "current": "temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m",
+                "hourly": "temperature_2m,precipitation_probability,weather_code",
+                "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum",
+                "forecast_days": WEATHER_FORECAST_DAYS,
                 "timezone": "auto",
             },
-            timeout=5,
+            timeout=6,
         )
         weather_resp.raise_for_status()
-        current = weather_resp.json().get("current")
+        payload = weather_resp.json()
+        current = payload.get("current")
         if not current:
             return None
 
-        display_name = place.get("name", location)
-        country = place.get("country")
+        hourly = payload.get("hourly") or {}
+        hourly_forecast = []
+        times = hourly.get("time") or []
+        if times:
+            now_str = current.get("time", "")
+            start_idx = next((i for i, t in enumerate(times) if t >= now_str), 0)
+            for i in range(start_idx, min(start_idx + 12, len(times))):
+                hourly_forecast.append({
+                    "time": times[i],
+                    "temperature": hourly["temperature_2m"][i],
+                    "precipitation_probability": hourly["precipitation_probability"][i],
+                    "description": WMO_WEATHER_DESCRIPTIONS.get(hourly["weather_code"][i], "알 수 없음"),
+                })
+
+        daily = payload.get("daily") or {}
+        daily_forecast = []
+        for i, day in enumerate(daily.get("time") or []):
+            daily_forecast.append({
+                "date": day,
+                "description": WMO_WEATHER_DESCRIPTIONS.get(daily["weather_code"][i], "알 수 없음"),
+                "temp_max": daily["temperature_2m_max"][i],
+                "temp_min": daily["temperature_2m_min"][i],
+                "precipitation_probability": daily["precipitation_probability_max"][i],
+                "precipitation_sum": daily["precipitation_sum"][i],
+            })
+
         return {
-            "location": f"{display_name}, {country}" if country else display_name,
+            "location": place.get("display_name", location),
             "observed_at": current.get("time"),
             "description": WMO_WEATHER_DESCRIPTIONS.get(current.get("weather_code"), "알 수 없음"),
             "temperature": current.get("temperature_2m"),
@@ -129,24 +210,54 @@ def _fetch_weather(location: str):
             "humidity": current.get("relative_humidity_2m"),
             "precipitation": current.get("precipitation"),
             "wind_speed": current.get("wind_speed_10m"),
+            "hourly": hourly_forecast,
+            "daily": daily_forecast,
         }
     except Exception:
         return None
 
 
+def _fetch_weather_for_query(user_text: str, default_location: str):
+    """문장에서 뽑은 지역 후보를 앞에서부터 시도해 지오코딩이 실제로 성공하는 첫 결과를 채택한다."""
+    for candidate in _weather_location_candidates(user_text, default_location)[:5]:
+        result = _fetch_weather(candidate)
+        if result:
+            return result
+    return None
+
+
 def _build_weather_context(weather: dict) -> str:
-    return "\n".join([
-        "[실시간 날씨 정보 (Open-Meteo API)]",
+    lines = [
+        "[실시간 날씨 정보 (Nominatim 지오코딩 + Open-Meteo 예보 API)]",
         f"지역: {weather['location']}",
         f"관측 시각: {weather['observed_at']}",
-        f"날씨: {weather['description']}",
+        f"현재 날씨: {weather['description']}",
         f"기온: {weather['temperature']}°C (체감 {weather['feels_like']}°C)",
         f"습도: {weather['humidity']}%",
         f"강수량: {weather['precipitation']}mm",
         f"풍속: {weather['wind_speed']}km/h",
-        "",
-        "위 실시간 날씨 데이터를 사실로 받아들여 답변하라. 데이터에 없는 내용은 추측하지 마라.",
-    ])
+    ]
+    if weather.get("hourly"):
+        lines.append("")
+        lines.append("시간대별 예보 (다음 12시간):")
+        for h in weather["hourly"]:
+            lines.append(
+                f"- {h['time']}: {h['description']}, 기온 {h['temperature']}°C, 강수확률 {h['precipitation_probability']}%"
+            )
+    if weather.get("daily"):
+        lines.append("")
+        lines.append(f"날짜별 예보 (앞으로 {len(weather['daily'])}일):")
+        for d in weather["daily"]:
+            lines.append(
+                f"- {d['date']}: {d['description']}, 최고 {d['temp_max']}°C / 최저 {d['temp_min']}°C, "
+                f"강수확률 {d['precipitation_probability']}%, 강수량 {d['precipitation_sum']}mm"
+            )
+    lines.append("")
+    lines.append(
+        "위 실시간 날씨 데이터를 사실로 받아들여 답변하라. 데이터에 없는 미래 시점(예: 예보 기간보다 먼 미래)에 "
+        "대해서는 모른다고 답하고 추측하지 마라."
+    )
+    return "\n".join(lines)
 
 
 def _render_weather(weather: dict):
@@ -157,6 +268,23 @@ def _render_weather(weather: dict):
         cols[1].metric("기온", f"{weather['temperature']}°C")
         cols[2].metric("체감", f"{weather['feels_like']}°C")
         cols[3].metric("습도", f"{weather['humidity']}%")
+
+        if weather.get("hourly"):
+            with st.expander(f"⏱️ 시간대별 예보 ({len(weather['hourly'])}시간)"):
+                for h in weather["hourly"]:
+                    time_label = h["time"][-5:]
+                    st.markdown(
+                        f"- **{time_label}**  {h['description']}, {h['temperature']}°C · 강수확률 {h['precipitation_probability']}%"
+                    )
+
+        if weather.get("daily"):
+            with st.expander(f"📅 날짜별 예보 ({len(weather['daily'])}일)"):
+                for d in weather["daily"]:
+                    st.markdown(
+                        f"- **{d['date']}**  {d['description']}, "
+                        f"{d['temp_min']}°C ~ {d['temp_max']}°C · 강수확률 {d['precipitation_probability']}% "
+                        f"({d['precipitation_sum']}mm)"
+                    )
 
 
 def _today_note() -> str:
@@ -237,7 +365,7 @@ with st.sidebar:
     use_weather_api = st.checkbox(
         "🌤️ 날씨 질문에 실시간 날씨 API 사용",
         value=True,
-        help="'~날씨'가 포함된 질문에는 검색 대신 Open-Meteo 실시간 날씨 API로 정확한 값을 가져옵니다.",
+        help="'~날씨'가 포함된 질문에는 검색 대신 실시간 날씨 API로 정확한 값을 가져옵니다. 현재 날씨/12시간 시간대별/앞으로 14일 예보까지 포함됩니다.",
     )
     default_weather_location = st.text_input(
         "기본 날씨 지역",
@@ -293,9 +421,8 @@ if user_input:
     weather_info = None
     search_results = []
     if use_weather_api and _looks_like_weather_query(user_input):
-        location = _extract_weather_location(user_input, default_weather_location)
-        with st.spinner(f"🌤️ {location} 날씨 조회 중..."):
-            weather_info = _fetch_weather(location)
+        with st.spinner("🌤️ 날씨 조회 중..."):
+            weather_info = _fetch_weather_for_query(user_input, default_weather_location)
         if not weather_info and use_web_search:
             with st.spinner("🔎 웹에서 최신 정보를 검색하는 중..."):
                 search_results = _web_search(user_input)
