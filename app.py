@@ -32,10 +32,18 @@ WEATHER_SKIP_TOKENS = {
     "오늘", "내일", "모레", "지금", "현재", "이번주", "이번", "주말", "여기", "이곳", "저기", "거기", "요즘",
     "알려줘", "알려주세요", "알려줄래", "어때", "어떄", "어떠니", "궁금해", "궁금합니다",
     "좀", "정도", "관련", "정보", "얼마나", "말해줘", "말해주세요", "확인해줘", "확인해주세요",
+    "그럼", "그러면", "그런데", "그냥", "아니", "저기요", "혹시", "음", "네", "예", "아",
 }
 
 # 지역명 뒤에 흔히 붙는 조사. 긴 것부터 검사해야 짧은 조사가 먼저 잘못 걸리지 않는다.
 KOREAN_PARTICLE_SUFFIXES = ("에서의", "에서", "에게", "으로", "부터", "까지", "의", "은", "는", "이", "가", "을", "를", "도", "에")
+
+# 한국 행정구역 접미사. 이걸로 끝나는 단어는 "그럼", "정도" 같은 일반 단어보다
+# 지역명일 가능성이 훨씬 높으므로 위치 후보를 고를 때 우선한다.
+PLACE_SUFFIXES = (
+    "특별자치시", "특별자치도", "광역시", "특별시", "자치구",
+    "시", "도", "구", "군", "읍", "면", "동", "리",
+)
 
 # WMO Weather interpretation codes (open-meteo.com 기준)
 WMO_WEATHER_DESCRIPTIONS = {
@@ -100,27 +108,62 @@ def _strip_korean_particle(token: str) -> str:
     return token
 
 
+def _looks_like_place(token: str) -> bool:
+    return len(token) >= 2 and token.endswith(PLACE_SUFFIXES)
+
+
+def _best_place_form(token: str) -> tuple:
+    """조사를 뗄지 말지를 결정한다.
+
+    "홍천군의"는 조사 '의'를 떼야 지역 접미사 '군'이 드러나지만("홍천군"),
+    "강원도"는 원본 자체가 이미 지역 접미사 '도'로 끝나므로 조사 제거 로직이
+    "~도(역시)" 조사로 오인해 "강원"으로 잘라버리면 안 된다. 원본이 이미
+    지역명처럼 보이면 원본을 우선하고, 그렇지 않을 때만 조사를 뗀 형태를 쓴다.
+    """
+    if _looks_like_place(token):
+        return token, True
+    stripped = _strip_korean_particle(token)
+    return stripped, _looks_like_place(stripped)
+
+
 def _weather_location_candidates(text: str, default: str):
-    """문장에서 지역명일 가능성이 있는 후보들을 순서대로 뽑아낸다.
+    """문장에서 지역명일 가능성이 있는 후보들을 우선순위대로 뽑아낸다.
 
     한국어는 지역명 뒤에 조사('의', '은' 등)가 자유롭게 붙고, "송파구의 오늘
     날씨"처럼 '날씨' 바로 앞이 아닌 곳에 지역명이 올 수도 있어서, 정규식으로
-    위치를 한 번에 콕 집어내려던 이전 방식은 "오늘"처럼 엉뚱한 단어를
-    뽑아내는 문제가 있었다. 대신 문장의 모든 단어에서 흔한 조사를 떼어낸 뒤,
-    지역명이 아닐 게 뻔한 단어만 걸러내고 나머지는 전부 후보로 남긴다.
-    실제로 어느 후보가 진짜 지역인지는 지오코딩 API가 검증하게 한다
-    (_fetch_weather_for_query 참고).
+    위치를 한 번에 콕 집어내려던 이전 방식은 "오늘"처럼 엉뚱한 단어를 뽑아내는
+    문제가 있었다. 그 다음 버전(조사만 떼고 전부 후보로 삼는 방식)도 "그럼"
+    같은 감탄사가 Nominatim에서 엉뚱한 가게 이름과 우연히 매칭되는 문제가
+    있었다.
+
+    이제는: (1) 시/도/구/군/읍/면/동 같은 한국 행정구역 접미사로 끝나는 단어를
+    지역명 후보로 최우선 취급하고, (2) 그런 단어가 문장에서 연달아 나오면
+    ("강원도" 다음에 "홍천군") 합쳐서("강원도 홍천군") 더 정확한 후보로 만든다.
+    이런 후보가 다 실패한 뒤에야 나머지 일반 단어를 시도한다. 최종 판단은
+    지오코딩 API가 실제로 찾아지는지로 검증한다 (_fetch_weather_for_query 참고).
     """
     tokens = re.findall(r"[가-힣A-Za-z0-9]+", text)
-    candidates = []
+    forms = []  # (form, is_place_like)
     for tok in tokens:
-        stripped = _strip_korean_particle(tok)
-        if len(stripped) < 2:
+        form, place_like = _best_place_form(tok)
+        if len(form) < 2:
             continue
-        if stripped in WEATHER_SKIP_TOKENS or "날씨" in stripped or "기온" in stripped:
+        if form in WEATHER_SKIP_TOKENS or "날씨" in form or "기온" in form:
             continue
-        if stripped not in candidates:
-            candidates.append(stripped)
+        forms.append((form, place_like))
+
+    combos = []
+    for (form_a, place_a), (form_b, place_b) in zip(forms, forms[1:]):
+        if place_a and place_b:
+            combos.append(f"{form_a} {form_b}")
+
+    place_singles = [f for f, is_place in forms if is_place]
+    other_singles = [f for f, is_place in forms if not is_place]
+
+    candidates = []
+    for c in combos + place_singles + other_singles:
+        if c not in candidates:
+            candidates.append(c)
     candidates.append(default)
     return candidates
 
@@ -136,13 +179,19 @@ def _geocode(location: str):
     """
     resp = requests.get(
         "https://nominatim.openstreetmap.org/search",
-        params={"q": location, "format": "json", "limit": 1, "accept-language": "ko"},
+        params={"q": location, "format": "json", "limit": 5, "accept-language": "ko"},
         headers={"User-Agent": NOMINATIM_USER_AGENT},
         timeout=6,
     )
     resp.raise_for_status()
-    results = resp.json()
-    return results[0] if results else None
+    results = resp.json() or []
+    if not results:
+        return None
+    # 식당/상점 같은 개별 시설(class="amenity"/"shop" 등)이 지역명과 우연히
+    # 이름이 겹쳐 엉뚱하게 매칭되는 걸 막기 위해, 행정구역/지명(class가 boundary
+    # 또는 place)을 우선한다. 그런 결과가 없으면 어쩔 수 없이 1순위를 쓴다.
+    administrative = [r for r in results if r.get("class") in ("boundary", "place")]
+    return (administrative or results)[0]
 
 
 def _fetch_weather(location: str):
@@ -219,7 +268,7 @@ def _fetch_weather(location: str):
 
 def _fetch_weather_for_query(user_text: str, default_location: str):
     """문장에서 뽑은 지역 후보를 앞에서부터 시도해 지오코딩이 실제로 성공하는 첫 결과를 채택한다."""
-    for candidate in _weather_location_candidates(user_text, default_location)[:5]:
+    for candidate in _weather_location_candidates(user_text, default_location)[:6]:
         result = _fetch_weather(candidate)
         if result:
             return result
