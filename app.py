@@ -1,3 +1,4 @@
+import json
 import re
 import time
 import uuid
@@ -26,6 +27,20 @@ DEFAULT_SYSTEM_PROMPT = """You are a helpful, honest assistant.
 NEW_CHAT_TITLE = "새 대화"
 WEB_SEARCH_MAX_RESULTS = 5
 WEB_SEARCH_RETRIES = 5
+NAVER_SEARCH_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+)
+
+# 검색엔진(네이버/DDG 모두)은 "~에 대해 설명해줘" 같은 자연어 지시문이 섞이면
+# 엉뚱한 결과를 준다. 흔한 지시어 꼬리를 잘라내고 핵심 키워드만 남긴다.
+QUERY_CLEANUP_PATTERNS = [
+    r"(이|가|은|는)?\s*(뭐야|뭔가요|무엇인가요|뭐임|뭐지)\s*[?？!！.]*$",
+    r"(에\s*대해서?|에\s*관해서?)?\s*(간단히|자세히|좀)?\s*"
+    r"(설명해\s*[줘죠]?|설명해주세요|설명해줄래|알려\s*[줘죠]?|알려주세요|알려줄래|말해\s*[줘죠]?|말해주세요).*$",
+    r"(좀|한번)?\s*(찾아|검색해)\s*(줘|주세요|줄래).*$",
+    r"[?？!！.]+$",
+]
 DEFAULT_WEATHER_LOCATION = "Seoul"
 NOMINATIM_USER_AGENT = "my-first-chat-bot/1.0 (personal streamlit weather feature)"
 WEATHER_FORECAST_DAYS = 14  # Open-Meteo 무료 플랜은 최대 16일까지 지원
@@ -194,16 +209,76 @@ def _new_conversation():
     st.session_state.current_id = conv_id
 
 
-def _web_search(query: str, max_results: int = WEB_SEARCH_MAX_RESULTS, retries: int = WEB_SEARCH_RETRIES):
-    """DuckDuckGo에서 실시간 정보를 검색한다.
+def _json_str_unescape(raw: str) -> str:
+    """정규식으로 뽑아낸 JSON 문자열 리터럴 내용(\\n, \\", \\uXXXX 등)을 해제한다."""
+    try:
+        return json.loads(f'"{raw}"')
+    except Exception:
+        return raw
+
+
+def _naver_web_search(query: str, max_results: int = WEB_SEARCH_MAX_RESULTS):
+    """네이버 통합검색 결과 페이지에서 정보를 추출한다 (비공식, API 키 불필요).
+
+    ddgs(DuckDuckGo)가 몇 초~몇십 초씩 완전히 응답하지 않는 경우를 직접
+    확인했고, 한국 기업/기관에 대해서는 네이버 쪽 결과가 훨씬 정확하고
+    풍부하다 (예: "크리스피드" 검색 시 네이버는 업종·사원수·대표자명까지
+    포함한 AI 요약을 페이지에 내장하지만, ddgs 뉴스 검색은 무관한 결과만
+    주는 경우가 있었다). 검색결과 페이지 HTML에 내장된 JSON 데이터에서
+    AI 요약/기업정보/스니펫 필드를 정규식으로 직접 뽑아낸다.
+
+    비공식 스크레이핑이라 네이버가 페이지 구조를 바꾸면 깨질 수 있다.
+    실패하거나 아무것도 못 찾으면 조용히 빈 리스트를 반환하고, 호출부에서
+    ddgs로 대체한다.
+    """
+    search_url = f"https://search.naver.com/search.naver?query={requests.utils.quote(query)}"
+    try:
+        resp = requests.get(
+            "https://search.naver.com/search.naver",
+            params={"query": query},
+            headers={"User-Agent": NAVER_SEARCH_USER_AGENT},
+            timeout=8,
+        )
+        resp.raise_for_status()
+        html = resp.text
+    except Exception:
+        return []
+
+    results = []
+    seen = set()
+
+    def add(title: str, body: str):
+        body = re.sub(r"</?mark>", "", body).strip()
+        if body and len(body) > 5 and body not in seen:
+            seen.add(body)
+            results.append({"title": title, "body": body, "href": search_url})
+
+    # 네이버 AI 요약 (신뢰도가 가장 높음)
+    for m in re.finditer(r'"aiSourceInfoText":"((?:[^"\\]|\\.)*)"', html):
+        add(f"{query} - 네이버 AI 요약", _json_str_unescape(m.group(1)))
+
+    # 업종/사원수/대표자명 같은 구조화된 기업정보
+    facts = re.findall(r'"key":"([^"]+)","valueData":\{"text":"((?:[^"\\]|\\.)*)"', html)
+    if facts:
+        fact_str = ", ".join(f"{k}: {_json_str_unescape(v)}" for k, v in facts[:6])
+        add(f"{query} - 네이버 기업정보", fact_str)
+
+    # 일반 검색결과 스니펫
+    for m in re.finditer(r'"bodyText":"((?:[^"\\]|\\.)*)"', html):
+        if len(results) >= max_results:
+            break
+        add(f"{query} - 네이버 검색", _json_str_unescape(m.group(1)))
+
+    return results[:max_results]
+
+
+def _ddgs_web_search(query: str, max_results: int = WEB_SEARCH_MAX_RESULTS, retries: int = WEB_SEARCH_RETRIES):
+    """DuckDuckGo(ddgs)에서 실시간 정보를 검색한다. 네이버 검색이 실패했을 때의 대체 수단.
 
     뉴스 검색(news)은 발행일(date)이 함께 오기 때문에 최신성 판단에 유리해
     우선하지만, "이 회사가 뭐 하는 곳이냐" 같은 일반 질문에는 기업정보
-    페이지 같은 일반 텍스트 검색(text) 결과가 훨씬 유용할 때가 많다.
-    (실제로 "크리스피드"를 검색했을 때 news는 무관한 2021년 기사 1건뿐이었지만,
-    text는 회사소개/기업정보 페이지 5건을 정확히 찾아냈다.) news 결과가
-    "있기는 하지만" 부실한 경우를 놓치지 않도록, 결과가 하나라도 있으면
-    끝내던 이전 방식 대신 둘 다 가져와 합친다.
+    페이지 같은 일반 텍스트 검색(text) 결과가 훨씬 유용할 때가 많다. news 결과가
+    "있기는 하지만" 부실한 경우를 놓치지 않도록 둘 다 가져와 합친다.
 
     ddgs 라이브러리는 여러 백엔드를 돌아가며 쓰는데 특정 백엔드가 타임아웃되거나
     "No results found"를 반환하는 등 꽤 불안정하다(같은 검색어로 3번 연속 시도했을 때
@@ -235,6 +310,29 @@ def _web_search(query: str, max_results: int = WEB_SEARCH_MAX_RESULTS, retries: 
         if len(deduped) >= max_results:
             break
     return deduped
+
+
+def _clean_search_query(text: str) -> str:
+    """검색어에서 "~에 대해 설명해줘" 같은 지시문 꼬리를 잘라 핵심 키워드만 남긴다.
+
+    검증해보니 네이버/DDG 둘 다 "크리스피드에 대해 설명해줘"라는 문장 전체를
+    검색하면 완전히 무관한 결과를 주지만, "크리스피드"만 검색하면 정확한
+    기업정보를 찾는다. 사용자 메시지를 그대로 검색어로 쓰던 이전 방식의
+    근본 문제였다. 다 잘라내서 빈 문자열이 되면 원문을 그대로 쓴다.
+    """
+    cleaned = text.strip()
+    for pattern in QUERY_CLEANUP_PATTERNS:
+        cleaned = re.sub(pattern, "", cleaned).strip()
+    return cleaned or text.strip()
+
+
+def _web_search(query: str, max_results: int = WEB_SEARCH_MAX_RESULTS):
+    """네이버 검색을 우선 시도하고, 결과가 없으면 DuckDuckGo로 대체한다."""
+    query = _clean_search_query(query)
+    naver_results = _naver_web_search(query, max_results=max_results)
+    if naver_results:
+        return naver_results
+    return _ddgs_web_search(query, max_results=max_results)
 
 
 def _looks_like_weather_query(text: str) -> bool:
