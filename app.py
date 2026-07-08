@@ -2,8 +2,10 @@ import re
 import uuid
 from datetime import datetime
 
+import pandas as pd
 import requests
 import streamlit as st
+import yfinance as yf
 from ddgs import DDGS
 from openai import OpenAI
 
@@ -17,7 +19,7 @@ DEFAULT_SYSTEM_PROMPT = """You are a helpful, honest assistant.
 - Only answer based on what is actually known or given in the conversation. Do not go off-topic or answer a question that was not asked.
 - If a question is ambiguous, ask a clarifying question instead of assuming.
 - Keep answers concise and directly relevant to the user's question.
-- You may be given a "실시간 웹 검색 결과" or "실시간 날씨 정보" context block. Use it when it helps answer the question, and mention the source briefly. Ignore it if it isn't relevant."""
+- You may be given a "실시간 웹 검색 결과", "실시간 날씨 정보", or "실시간 주식 시세" context block. Use it when it helps answer the question, and mention the source briefly. Ignore it if it isn't relevant."""
 
 NEW_CHAT_TITLE = "새 대화"
 WEB_SEARCH_MAX_RESULTS = 5
@@ -44,6 +46,60 @@ PLACE_SUFFIXES = (
     "특별자치시", "특별자치도", "광역시", "특별시", "자치구",
     "시", "도", "구", "군", "읍", "면", "동", "리",
 )
+
+STOCK_KEYWORDS = ["주가", "주식", "시세", "종목", "증시", "상한가", "하한가", "매수", "매도", "코스피", "코스닥", "나스닥"]
+
+STOCK_SKIP_TOKENS = {
+    "오늘", "내일", "모레", "지금", "현재", "이번주", "이번", "요즘",
+    "알려줘", "알려주세요", "알려줄래", "어때", "어떄", "얼마", "얼마야", "얼마임", "궁금해", "궁금합니다",
+    "좀", "정도", "관련", "정보", "말해줘", "말해주세요", "확인해줘", "확인해주세요",
+    "그럼", "그러면", "그런데", "그냥", "아니", "혹시", "음", "네", "예", "아",
+}
+
+# 한국어 종목명/별칭 -> Yahoo Finance 티커. yfinance의 검색 기능이 한글 질의에는
+# 거의 응답하지 않아서(예: "삼성전자" 검색 시 결과 0건), 흔히 찾는 종목은 직접
+# 매핑해둔다. 매핑에 없는 영문 티커/회사명은 yfinance.Search로 대체 조회한다.
+STOCK_ALIASES = {
+    # KOSPI 대형주
+    "삼성전자": "005930.KS", "삼성전자우": "005935.KS",
+    "SK하이닉스": "000660.KS", "LG에너지솔루션": "373220.KS",
+    "삼성바이오로직스": "207940.KS", "현대차": "005380.KS", "현대자동차": "005380.KS",
+    "기아": "000270.KS", "셀트리온": "068270.KS",
+    "POSCO홀딩스": "005490.KS", "포스코홀딩스": "005490.KS", "포스코": "005490.KS",
+    "네이버": "035420.KS", "NAVER": "035420.KS",
+    "카카오": "035720.KS", "카카오뱅크": "323410.KS", "카카오페이": "377300.KS",
+    "LG화학": "051910.KS", "삼성SDI": "006400.KS", "현대모비스": "012330.KS",
+    "KB금융": "105560.KS", "신한지주": "055550.KS", "하나금융지주": "086790.KS", "우리금융지주": "316140.KS",
+    "SK이노베이션": "096770.KS", "SK텔레콤": "017670.KS", "KT": "030200.KS", "KT&G": "033780.KS",
+    "LG전자": "066570.KS", "한국전력": "015760.KS", "삼성물산": "028260.KS",
+    "두산에너빌리티": "034020.KS", "한화에어로스페이스": "012450.KS", "HD현대중공업": "329180.KS",
+    "크래프톤": "259960.KS", "엔씨소프트": "036570.KS", "넷마블": "251270.KS",
+    "삼성생명": "032830.KS", "삼성화재": "000810.KS", "LG": "003550.KS", "SK": "034730.KS",
+    # KOSDAQ
+    "에코프로": "086520.KQ", "에코프로비엠": "247540.KQ", "알테오젠": "196170.KQ",
+    "셀트리온헬스케어": "091990.KQ", "펄어비스": "263750.KQ",
+    # 미국 대형주
+    "애플": "AAPL", "테슬라": "TSLA", "마이크로소프트": "MSFT",
+    "구글": "GOOGL", "알파벳": "GOOGL", "아마존": "AMZN", "엔비디아": "NVDA",
+    "메타": "META", "페이스북": "META", "넷플릭스": "NFLX", "코카콜라": "KO",
+    "스타벅스": "SBUX", "디즈니": "DIS", "나이키": "NKE", "인텔": "INTC", "퀄컴": "QCOM",
+    "보잉": "BA", "월마트": "WMT", "맥도날드": "MCD", "버크셔해서웨이": "BRK-B", "알리바바": "BABA",
+}
+
+STOCK_TREND_KEYWORDS = ["추이", "추세", "차트", "그래프", "히스토리", "흐름", "변동"]
+
+# (기간을 나타내는 정규식, yfinance period 문자열). 위에서부터 먼저 매치되는 걸 쓴다.
+STOCK_PERIOD_PATTERNS = [
+    (r"(5|다섯)\s*년", "5y"),
+    (r"(3|세)\s*년", "3y"),
+    (r"(1|일)?\s*년|작년|올해|연초", "1y"),
+    (r"(6|여섯)\s*개월|반년", "6mo"),
+    (r"(3|세)\s*개월|분기", "3mo"),
+    (r"(1|한)?\s*개월|한\s*달|1\s*달|지난\s*달", "1mo"),
+    (r"(1|한|일)\s*주일?|일주일|지난\s*주", "5d"),
+    (r"며칠", "5d"),
+]
+STOCK_DEFAULT_TREND_PERIOD = "1mo"
 
 # WMO Weather interpretation codes (open-meteo.com 기준)
 WMO_WEATHER_DESCRIPTIONS = {
@@ -336,6 +392,217 @@ def _render_weather(weather: dict):
                     )
 
 
+def _looks_like_stock_query(text: str) -> bool:
+    return any(keyword in text for keyword in STOCK_KEYWORDS)
+
+
+def _looks_like_stock_trend_query(text: str) -> bool:
+    if any(keyword in text for keyword in STOCK_TREND_KEYWORDS):
+        return True
+    return any(re.search(pattern, text) for pattern, _ in STOCK_PERIOD_PATTERNS)
+
+
+def _detect_stock_period(text: str) -> str:
+    for pattern, period in STOCK_PERIOD_PATTERNS:
+        if re.search(pattern, text):
+            return period
+    return STOCK_DEFAULT_TREND_PERIOD
+
+
+def _stock_candidates(text: str):
+    """문장에서 종목명/티커일 가능성이 있는 후보들을 뽑아낸다.
+
+    회사명은 지역명과 달리 공통 접미사가 없어 "지역 접미사 우선" 같은 규칙이
+    통하지 않는다. 대신 STOCK_ALIASES 사전 조회 자체가 정확히 일치하는
+    경우에만 반응하는 안전한 방식이라(퍼지 매칭 아님), 문장의 모든 단어에서
+    조사만 뗀 뒤 후보로 남기는 단순한 방식으로도 충분하다.
+    """
+    tokens = re.findall(r"[가-힣A-Za-z0-9&.\-]+", text)
+    candidates = []
+    for tok in tokens:
+        for form in dict.fromkeys([tok, _strip_korean_particle(tok)]):
+            if not form:
+                continue
+            if form in STOCK_SKIP_TOKENS or any(kw in form for kw in STOCK_KEYWORDS):
+                continue
+            if form not in candidates:
+                candidates.append(form)
+    return candidates
+
+
+def _ticker_guesses(candidate: str):
+    """후보 단어 하나에서 시도해볼 만한 (티커, 표시용 이름) 조합을 생성한다."""
+    alias_ticker = STOCK_ALIASES.get(candidate)
+    if alias_ticker:
+        yield alias_ticker, candidate
+        return
+
+    if re.fullmatch(r"\d{6}", candidate):
+        # 한국 종목코드. 코스피(.KS)를 먼저, 코스닥(.KQ)을 그다음으로 시도한다.
+        yield f"{candidate}.KS", candidate
+        yield f"{candidate}.KQ", candidate
+        return
+
+    if candidate.isascii():
+        if re.fullmatch(r"[A-Za-z]{1,5}(-[A-Za-z])?(\.[A-Za-z]{1,3})?", candidate):
+            yield candidate.upper(), candidate.upper()
+            return
+        if len(candidate) >= 2:
+            try:
+                results = yf.Search(candidate, max_results=1).quotes
+                if results:
+                    r = results[0]
+                    yield r["symbol"], r.get("shortname") or r["symbol"]
+            except Exception:
+                pass
+
+
+def _fetch_stock(ticker: str, display_name: str):
+    """yfinance(Yahoo Finance, 무료·API 키 불필요)로 실시간 시세를 조회한다.
+
+    quote_type이 "EQUITY"가 아니면 버린다. 종목코드를 ".KQ"로 잘못 추측했을 때
+    (예: "005930.KQ") 엉뚱한 뮤추얼펀드가 그럴듯한 가격과 함께 매칭되는 걸
+    직접 확인해서 추가한 안전장치다. 실패하면 None을 반환한다.
+    """
+    try:
+        info = yf.Ticker(ticker).fast_info
+        price = getattr(info, "last_price", None)
+        quote_type = getattr(info, "quote_type", None)
+        if price is None or quote_type != "EQUITY":
+            return None
+
+        previous_close = getattr(info, "previous_close", None) or getattr(
+            info, "regular_market_previous_close", None
+        )
+        change = (price - previous_close) if previous_close else None
+        change_pct = (change / previous_close * 100) if change is not None and previous_close else None
+
+        return {
+            "ticker": ticker,
+            "name": display_name or ticker,
+            "currency": getattr(info, "currency", "") or "",
+            "price": price,
+            "previous_close": previous_close,
+            "change": change,
+            "change_pct": change_pct,
+            "day_high": getattr(info, "day_high", None),
+            "day_low": getattr(info, "day_low", None),
+            "volume": getattr(info, "last_volume", None),
+            "market_cap": getattr(info, "market_cap", None),
+        }
+    except Exception:
+        return None
+
+
+def _fetch_stock_history(ticker: str, period: str):
+    """yfinance로 기간별 시세 추이를 가져온다. 실패하거나 데이터가 없으면 None을 반환한다."""
+    try:
+        hist = yf.Ticker(ticker).history(period=period)
+        if hist is None or hist.empty:
+            return None
+        closes = hist["Close"]
+        start_price = float(closes.iloc[0])
+        end_price = float(closes.iloc[-1])
+        return {
+            "period": period,
+            "start_date": closes.index[0].strftime("%Y-%m-%d"),
+            "end_date": closes.index[-1].strftime("%Y-%m-%d"),
+            "start_price": start_price,
+            "end_price": end_price,
+            "period_high": float(hist["High"].max()),
+            "period_low": float(hist["Low"].min()),
+            "change": end_price - start_price,
+            "change_pct": ((end_price - start_price) / start_price * 100) if start_price else None,
+            # 차트 렌더링용 일별 종가. 세션에 저장했다가 재구성해야 하므로 날짜 문자열로 직렬화한다.
+            "series": {d.strftime("%Y-%m-%d"): float(v) for d, v in closes.items()},
+        }
+    except Exception:
+        return None
+
+
+def _fetch_stock_for_query(user_text: str):
+    """문장에서 뽑은 종목 후보를 앞에서부터 시도해 실제로 조회되는 첫 결과를 채택한다.
+
+    "추이/차트/1달간" 같은 기간 표현이 있으면 현재가에 더해 해당 기간의
+    시세 추이(history)도 함께 가져온다.
+    """
+    for candidate in _stock_candidates(user_text)[:6]:
+        for ticker, display_name in _ticker_guesses(candidate):
+            result = _fetch_stock(ticker, display_name)
+            if result:
+                if _looks_like_stock_trend_query(user_text):
+                    period = _detect_stock_period(user_text)
+                    history = _fetch_stock_history(ticker, period)
+                    if history:
+                        result["history"] = history
+                return result
+    return None
+
+
+def _build_stock_context(stock: dict) -> str:
+    lines = [
+        "[실시간 주식 시세 (Yahoo Finance / yfinance)]",
+        f"종목: {stock['name']} ({stock['ticker']})",
+        f"현재가: {stock['price']:,.2f} {stock['currency']}",
+    ]
+    if stock.get("previous_close") is not None:
+        lines.append(f"전일종가: {stock['previous_close']:,.2f} {stock['currency']}")
+    if stock.get("change") is not None:
+        lines.append(f"등락: {stock['change']:+,.2f} ({stock['change_pct']:+.2f}%)")
+    if stock.get("day_high") is not None:
+        lines.append(f"당일 고가/저가: {stock['day_high']:,.2f} / {stock['day_low']:,.2f}")
+    if stock.get("volume") is not None:
+        lines.append(f"거래량: {stock['volume']:,}")
+    if stock.get("market_cap") is not None:
+        lines.append(f"시가총액: {stock['market_cap']:,}")
+
+    history = stock.get("history")
+    if history:
+        lines.append("")
+        lines.append(f"기간별 추이 ({history['start_date']} ~ {history['end_date']}, period={history['period']}):")
+        lines.append(f"- 시작가: {history['start_price']:,.2f} / 종료가(최근): {history['end_price']:,.2f}")
+        lines.append(f"- 기간 등락: {history['change']:+,.2f} ({history['change_pct']:+.2f}%)")
+        lines.append(f"- 기간 고가/저가: {history['period_high']:,.2f} / {history['period_low']:,.2f}")
+
+    lines.append("")
+    lines.append(
+        "위 실시간 시세 데이터를 사실로 받아들여 답변하라. 이 데이터는 실시간이 아니라 최대 15~20분 지연될 "
+        "수 있음을 밝혀라. 목표주가나 미래 전망처럼 데이터에 없는 내용은 추측하지 말고 모른다고 답하라."
+    )
+    return "\n".join(lines)
+
+
+def _render_stock(stock: dict):
+    with st.container(border=True):
+        st.markdown(f"📈 **{stock['name']}** ({stock['ticker']})")
+        cols = st.columns(4)
+        change_label = None
+        if stock.get("change") is not None:
+            change_label = f"{stock['change']:+,.2f} ({stock['change_pct']:+.2f}%)"
+        cols[0].metric("현재가", f"{stock['price']:,.2f} {stock['currency']}", change_label)
+        cols[1].metric(
+            "전일종가",
+            f"{stock['previous_close']:,.2f}" if stock.get("previous_close") is not None else "-",
+        )
+        cols[2].metric(
+            "고가/저가",
+            f"{stock['day_high']:,.2f} / {stock['day_low']:,.2f}" if stock.get("day_high") is not None else "-",
+        )
+        cols[3].metric("거래량", f"{stock['volume']:,}" if stock.get("volume") is not None else "-")
+        st.caption("Yahoo Finance 기준, 실시간이 아니라 최대 15~20분 지연될 수 있습니다.")
+
+        history = stock.get("history")
+        if history:
+            st.markdown(
+                f"**{history['start_date']} ~ {history['end_date']} 추이**  "
+                f"{history['start_price']:,.2f} → {history['end_price']:,.2f} "
+                f"({history['change_pct']:+.2f}%) · 고가 {history['period_high']:,.2f} / 저가 {history['period_low']:,.2f}"
+            )
+            series = pd.Series(history["series"])
+            series.index = pd.to_datetime(series.index)
+            st.line_chart(series)
+
+
 def _today_note() -> str:
     """오늘 날짜를 항상 시스템 프롬프트에 포함시킨다 (검색 결과 유무와 무관하게).
 
@@ -421,6 +688,11 @@ with st.sidebar:
         value=DEFAULT_WEATHER_LOCATION,
         help="질문에 지역명이 없을 때(예: '오늘 날씨 어때?') 사용할 기본 지역입니다.",
     )
+    use_stock_api = st.checkbox(
+        "📈 주식 질문에 실시간 시세 API 사용",
+        value=True,
+        help="'~주가/시세' 등이 포함된 질문에는 검색 대신 Yahoo Finance 실시간 시세를 가져옵니다. 국내(삼성전자 등)/해외(AAPL 등) 종목을 모두 지원하며, '추이/차트/1달간' 같은 표현이 있으면 기간별 추이 차트도 함께 보여줍니다.",
+    )
 
     if st.button("🆕 새 대화", use_container_width=True):
         _new_conversation()
@@ -453,6 +725,8 @@ for message in messages:
     with st.chat_message(message["role"]):
         if message.get("weather"):
             _render_weather(message["weather"])
+        if message.get("stock"):
+            _render_stock(message["stock"])
         st.markdown(message["content"])
         if message.get("sources"):
             _render_sources(message["sources"])
@@ -468,11 +742,18 @@ if user_input:
         st.markdown(user_input)
 
     weather_info = None
+    stock_info = None
     search_results = []
     if use_weather_api and _looks_like_weather_query(user_input):
         with st.spinner("🌤️ 날씨 조회 중..."):
             weather_info = _fetch_weather_for_query(user_input, default_weather_location)
         if not weather_info and use_web_search:
+            with st.spinner("🔎 웹에서 최신 정보를 검색하는 중..."):
+                search_results = _web_search(user_input)
+    elif use_stock_api and _looks_like_stock_query(user_input):
+        with st.spinner("📈 시세 조회 중..."):
+            stock_info = _fetch_stock_for_query(user_input)
+        if not stock_info and use_web_search:
             with st.spinner("🔎 웹에서 최신 정보를 검색하는 중..."):
                 search_results = _web_search(user_input)
     elif use_web_search:
@@ -483,6 +764,8 @@ if user_input:
     combined_system_prompt = system_prompt + "\n\n" + _today_note()
     if weather_info:
         combined_system_prompt += "\n\n" + _build_weather_context(weather_info)
+    if stock_info:
+        combined_system_prompt += "\n\n" + _build_stock_context(stock_info)
     if search_results:
         combined_system_prompt += "\n\n" + _build_search_context(search_results)
     request_messages = [{"role": "system", "content": combined_system_prompt}] + history_for_request
@@ -490,6 +773,8 @@ if user_input:
     with st.chat_message("assistant"):
         if weather_info:
             _render_weather(weather_info)
+        if stock_info:
+            _render_stock(stock_info)
         if search_results:
             _render_sources(search_results)
 
@@ -545,6 +830,8 @@ if user_input:
     assistant_message = {"role": "assistant", "content": full_response}
     if weather_info:
         assistant_message["weather"] = weather_info
+    if stock_info:
+        assistant_message["stock"] = stock_info
     if search_results:
         assistant_message["sources"] = search_results
     messages.append(assistant_message)
