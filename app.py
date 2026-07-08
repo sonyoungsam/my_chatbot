@@ -61,8 +61,9 @@ STOCK_SKIP_TOKENS = {
 # 매핑해둔다. 매핑에 없는 영문 티커/회사명은 yfinance.Search로 대체 조회한다.
 STOCK_ALIASES = {
     # KOSPI 대형주
-    "삼성전자": "005930.KS", "삼성전자우": "005935.KS",
-    "SK하이닉스": "000660.KS", "LG에너지솔루션": "373220.KS",
+    "삼성전자": "005930.KS", "삼성전자우": "005935.KS", "삼전": "005930.KS",
+    "SK하이닉스": "000660.KS", "하이닉스": "000660.KS",
+    "LG에너지솔루션": "373220.KS", "엘지에너지솔루션": "373220.KS", "LG엔솔": "373220.KS",
     "삼성바이오로직스": "207940.KS", "현대차": "005380.KS", "현대자동차": "005380.KS",
     "기아": "000270.KS", "셀트리온": "068270.KS",
     "POSCO홀딩스": "005490.KS", "포스코홀딩스": "005490.KS", "포스코": "005490.KS",
@@ -85,6 +86,8 @@ STOCK_ALIASES = {
     "스타벅스": "SBUX", "디즈니": "DIS", "나이키": "NKE", "인텔": "INTC", "퀄컴": "QCOM",
     "보잉": "BA", "월마트": "WMT", "맥도날드": "MCD", "버크셔해서웨이": "BRK-B", "알리바바": "BABA",
 }
+
+NAVER_EXCHANGE_TO_YAHOO_SUFFIX = {"KOSPI": ".KS", "KOSDAQ": ".KQ"}
 
 STOCK_TREND_KEYWORDS = ["추이", "추세", "차트", "그래프", "히스토리", "흐름", "변동"]
 
@@ -413,14 +416,14 @@ def _stock_candidates(text: str):
     """문장에서 종목명/티커일 가능성이 있는 후보들을 뽑아낸다.
 
     회사명은 지역명과 달리 공통 접미사가 없어 "지역 접미사 우선" 같은 규칙이
-    통하지 않는다. 대신 STOCK_ALIASES 사전 조회 자체가 정확히 일치하는
-    경우에만 반응하는 안전한 방식이라(퍼지 매칭 아님), 문장의 모든 단어에서
-    조사만 뗀 뒤 후보로 남기는 단순한 방식으로도 충분하다.
+    통하지 않는다. 문장의 모든 단어에서 조사를 뗀 형태를 후보로 남기되,
+    조사를 뗀 깔끔한 형태("하이닉스")를 원본("하이닉스의")보다 먼저 시도해서
+    매칭됐을 때 표시 이름도 깔끔하게 나오게 한다.
     """
     tokens = re.findall(r"[가-힣A-Za-z0-9&.\-]+", text)
     candidates = []
     for tok in tokens:
-        for form in dict.fromkeys([tok, _strip_korean_particle(tok)]):
+        for form in dict.fromkeys([_strip_korean_particle(tok), tok]):
             if not form:
                 continue
             if form in STOCK_SKIP_TOKENS or any(kw in form for kw in STOCK_KEYWORDS):
@@ -430,9 +433,57 @@ def _stock_candidates(text: str):
     return candidates
 
 
+def _alias_lookup(candidate: str):
+    """STOCK_ALIASES에서 종목을 찾는다. 정확히 일치하지 않으면 부분일치도 시도한다.
+
+    "SK하이닉스"는 사전에 있어도 사람들은 흔히 "하이닉스"라고만 말한다.
+    이런 줄임말/별칭을 일일이 다 등록할 수 없으니, 후보가 사전의 어느
+    종목명과 부분적으로 겹치면(예: "하이닉스" ⊂ "SK하이닉스") 그것도 채택한다.
+    후보가 너무 짧으면(2자 이하) 엉뚱한 종목과 겹칠 위험이 있어 제외한다.
+    """
+    if candidate in STOCK_ALIASES:
+        return STOCK_ALIASES[candidate]
+    if len(candidate) >= 3:
+        for name, ticker in STOCK_ALIASES.items():
+            if candidate in name or name in candidate:
+                return ticker
+    return None
+
+
+def _naver_stock_search(query: str, max_results: int = 3):
+    """네이버 금융 자동완성 검색(무료·API 키 불필요)으로 실제 상장 종목을 찾는다.
+
+    STOCK_ALIASES는 손으로 만든 목록이라 "삼성전기" 같은 종목이 빠지면 그냥
+    못 찾는다. 이 검색은 KRX/해외 상장 종목 전체를 대상으로 하고, "그럼" 같은
+    무의미한 단어는 빈 결과를 반환해서(Nominatim처럼 엉뚱한 걸 억지로
+    매칭하지 않음) 안전하다. 실패하면 빈 리스트를 반환한다.
+    """
+    try:
+        resp = requests.get(
+            "https://ac.stock.naver.com/ac",
+            params={"q": query, "target": "stock,index,marketindicator"},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        return (resp.json().get("items") or [])[:max_results]
+    except Exception:
+        return []
+
+
+def _naver_item_to_ticker(item: dict):
+    code = item.get("code")
+    if not code:
+        return None
+    if item.get("nationCode") == "KOR":
+        suffix = NAVER_EXCHANGE_TO_YAHOO_SUFFIX.get(item.get("typeCode"))
+        return f"{code}{suffix}" if suffix else None
+    # 해외 종목은 code가 이미 야후 티커 형식(예: TSLA)이다.
+    return code
+
+
 def _ticker_guesses(candidate: str):
     """후보 단어 하나에서 시도해볼 만한 (티커, 표시용 이름) 조합을 생성한다."""
-    alias_ticker = STOCK_ALIASES.get(candidate)
+    alias_ticker = _alias_lookup(candidate)
     if alias_ticker:
         yield alias_ticker, candidate
         return
@@ -443,18 +494,18 @@ def _ticker_guesses(candidate: str):
         yield f"{candidate}.KQ", candidate
         return
 
-    if candidate.isascii():
-        if re.fullmatch(r"[A-Za-z]{1,5}(-[A-Za-z])?(\.[A-Za-z]{1,3})?", candidate):
-            yield candidate.upper(), candidate.upper()
-            return
-        if len(candidate) >= 2:
-            try:
-                results = yf.Search(candidate, max_results=1).quotes
-                if results:
-                    r = results[0]
-                    yield r["symbol"], r.get("shortname") or r["symbol"]
-            except Exception:
-                pass
+    if candidate.isascii() and re.fullmatch(r"[A-Za-z]{1,5}(-[A-Za-z])?(\.[A-Za-z]{1,3})?", candidate):
+        yield candidate.upper(), candidate.upper()
+        return
+
+    if len(candidate) < 2:
+        return
+
+    # 사전에 없는 종목명(국내/해외 모두)은 네이버 검색으로 실제 상장 여부를 확인한다.
+    for item in _naver_stock_search(candidate):
+        ticker = _naver_item_to_ticker(item)
+        if ticker:
+            yield ticker, item.get("name") or candidate
 
 
 def _fetch_stock(ticker: str, display_name: str):
@@ -628,6 +679,9 @@ def _build_search_context(results):
         "결과들의 시점이 서로 다르면 발행일이 더 최근인 결과를 우선하라.",
         "관련이 있으면 이 정보를 바탕으로 답변하고, 관련이 없으면 무시하라.",
         "답변에 사용한 내용이 있다면 마지막에 출처 URL을 간단히 남겨라.",
+        "이 결과는 검색 스니펫일 뿐, 실시간 시세/날씨 API처럼 구조화된 정확한 수치 데이터가 아니다.",
+        "스니펫에 정확히 적혀 있지 않은 구체적인 숫자(예: 정확한 주가, 등락률, 기온)를 마치 실시간",
+        "데이터를 조회한 것처럼 지어내지 마라. 정확한 수치가 없으면 대략적으로만 말하거나 모른다고 하라.",
         "",
     ]
     for i, r in enumerate(results, 1):
