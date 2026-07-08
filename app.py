@@ -1,4 +1,5 @@
 import re
+import time
 import uuid
 from datetime import datetime
 
@@ -10,6 +11,7 @@ from ddgs import DDGS
 from openai import OpenAI
 
 LLM_BASE_URL = "http://192.168.0.201:18000/v1"
+STREAM_UI_MIN_INTERVAL = 0.15  # 초. 화면 갱신 간격 최소치 (DOM 갱신이 너무 잦아 생기는 오류 방지)
 LLM_MODEL = "Qwen/Qwen3.6-35B-A3B-FP8"
 
 DEFAULT_SYSTEM_PROMPT = """You are a helpful, honest assistant.
@@ -23,6 +25,7 @@ DEFAULT_SYSTEM_PROMPT = """You are a helpful, honest assistant.
 
 NEW_CHAT_TITLE = "새 대화"
 WEB_SEARCH_MAX_RESULTS = 5
+WEB_SEARCH_RETRIES = 5
 DEFAULT_WEATHER_LOCATION = "Seoul"
 NOMINATIM_USER_AGENT = "my-first-chat-bot/1.0 (personal streamlit weather feature)"
 WEATHER_FORECAST_DAYS = 14  # Open-Meteo 무료 플랜은 최대 16일까지 지원
@@ -127,6 +130,63 @@ def _partial_tag_len(text: str, tag: str) -> int:
     return 0
 
 
+def _stream_visible_chunks(stream, min_interval: float = STREAM_UI_MIN_INTERVAL):
+    """OpenAI 스트림에서 <think>...</think>를 걸러낸 화면 표시용 텍스트 조각을 순서대로 내보낸다.
+
+    st.write_stream에 넘기기 위한 제너레이터다. 매 토큰마다 직접
+    placeholder.markdown()을 호출하던 이전 방식은 브라우저 쪽 React DOM
+    갱신이 너무 잦아져 "NotFoundError: removeChild" 오류를 유발했다.
+    st.write_stream으로 바꿔도(내부적으로 결국 비슷하게 자주 갱신하므로)
+    같은 오류가 재현될 수 있어서, 여기서 직접 최소 시간 간격(min_interval)
+    이상 모아뒀다가 한 번에 내보내 실제 DOM 갱신 횟수 자체를 줄인다.
+    """
+    buffer = ""
+    in_think = False
+    visible_response = ""
+    yielded_len = 0
+    pending = ""
+    last_yield = time.monotonic()
+    for chunk in stream:
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+        # 일부 서버는 추론 내용을 별도의 reasoning_content 필드로 보내므로 무시한다.
+        piece = getattr(delta, "content", None)
+        if not piece:
+            continue
+        buffer += piece
+
+        # <think>...</think> 블록은 스트리밍 중에도 화면에 노출되지 않도록 걸러낸다.
+        while True:
+            tag = "</think>" if in_think else "<think>"
+            idx = buffer.find(tag)
+            if idx != -1:
+                if not in_think:
+                    visible_response += buffer[:idx]
+                buffer = buffer[idx + len(tag):]
+                in_think = not in_think
+                continue
+
+            # 태그가 청크 경계에서 잘렸을 수 있으니 안전한 부분까지만 흘려보낸다.
+            partial = _partial_tag_len(buffer, tag)
+            if not in_think:
+                visible_response += buffer[: len(buffer) - partial]
+            buffer = buffer[len(buffer) - partial:]
+            break
+
+        if len(visible_response) > yielded_len:
+            pending += visible_response[yielded_len:]
+            yielded_len = len(visible_response)
+            now = time.monotonic()
+            if now - last_yield >= min_interval:
+                yield pending
+                pending = ""
+                last_yield = now
+
+    if pending:
+        yield pending
+
+
 def _new_conversation():
     conv_id = str(uuid.uuid4())
     st.session_state.conversations[conv_id] = {"title": NEW_CHAT_TITLE, "messages": []}
@@ -134,21 +194,47 @@ def _new_conversation():
     st.session_state.current_id = conv_id
 
 
-def _web_search(query: str, max_results: int = WEB_SEARCH_MAX_RESULTS):
+def _web_search(query: str, max_results: int = WEB_SEARCH_MAX_RESULTS, retries: int = WEB_SEARCH_RETRIES):
     """DuckDuckGo에서 실시간 정보를 검색한다.
 
-    뉴스 검색(news)은 발행일(date)이 함께 오기 때문에, 날짜가 없어 모델이
-    최신성을 판단할 근거가 없는 일반 텍스트 검색(text)보다 우선한다.
-    뉴스 결과가 없을 때만 텍스트 검색으로 대체한다. 실패하면 빈 리스트를 반환한다.
+    뉴스 검색(news)은 발행일(date)이 함께 오기 때문에 최신성 판단에 유리해
+    우선하지만, "이 회사가 뭐 하는 곳이냐" 같은 일반 질문에는 기업정보
+    페이지 같은 일반 텍스트 검색(text) 결과가 훨씬 유용할 때가 많다.
+    (실제로 "크리스피드"를 검색했을 때 news는 무관한 2021년 기사 1건뿐이었지만,
+    text는 회사소개/기업정보 페이지 5건을 정확히 찾아냈다.) news 결과가
+    "있기는 하지만" 부실한 경우를 놓치지 않도록, 결과가 하나라도 있으면
+    끝내던 이전 방식 대신 둘 다 가져와 합친다.
+
+    ddgs 라이브러리는 여러 백엔드를 돌아가며 쓰는데 특정 백엔드가 타임아웃되거나
+    "No results found"를 반환하는 등 꽤 불안정하다(같은 검색어로 3번 연속 시도했을 때
+    정상/타임아웃/결과없음이 각각 나온 걸 직접 확인함). 그래서 실패하면 잠깐 쉬었다가
+    몇 번 재시도한다. 그래도 실패하면 빈 리스트를 반환한다.
     """
-    try:
-        with DDGS() as ddgs:
-            results = list(ddgs.news(query, max_results=max_results))
-            if not results:
-                results = list(ddgs.text(query, max_results=max_results))
-            return results
-    except Exception:
-        return []
+    news_results, text_results = [], []
+    for attempt in range(retries):
+        try:
+            with DDGS() as ddgs:
+                news_results = list(ddgs.news(query, max_results=max_results))
+                text_results = list(ddgs.text(query, max_results=max_results))
+            if news_results or text_results:
+                break
+        except Exception:
+            pass
+        if attempt < retries - 1:
+            time.sleep(1.5 * (attempt + 1))  # 1.5s, 3s, 4.5s, ... 백엔드가 잠깐 죽어있는 경우를 더 버틴다
+
+    combined = news_results + text_results
+    seen = set()
+    deduped = []
+    for r in combined:
+        key = r.get("url") or r.get("href") or r.get("link") or r.get("title")
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(r)
+        if len(deduped) >= max_results:
+            break
+    return deduped
 
 
 def _looks_like_weather_query(text: str) -> bool:
@@ -368,8 +454,8 @@ def _build_weather_context(weather: dict) -> str:
     return "\n".join(lines)
 
 
-def _render_weather(weather: dict):
-    with st.container(border=True):
+def _render_weather(weather: dict, key: str = "live"):
+    with st.container(border=True, key=f"weather_{key}"):
         st.markdown(f"🌤️ **{weather['location']}** 실시간 날씨  ·  {weather['observed_at']}")
         cols = st.columns(4)
         cols[0].metric("날씨", weather["description"])
@@ -378,7 +464,7 @@ def _render_weather(weather: dict):
         cols[3].metric("습도", f"{weather['humidity']}%")
 
         if weather.get("hourly"):
-            with st.expander(f"⏱️ 시간대별 예보 ({len(weather['hourly'])}시간)"):
+            with st.expander(f"⏱️ 시간대별 예보 ({len(weather['hourly'])}시간)", key=f"weather_hourly_{key}"):
                 for h in weather["hourly"]:
                     time_label = h["time"][-5:]
                     st.markdown(
@@ -386,7 +472,7 @@ def _render_weather(weather: dict):
                     )
 
         if weather.get("daily"):
-            with st.expander(f"📅 날짜별 예보 ({len(weather['daily'])}일)"):
+            with st.expander(f"📅 날짜별 예보 ({len(weather['daily'])}일)", key=f"weather_daily_{key}"):
                 for d in weather["daily"]:
                     st.markdown(
                         f"- **{d['date']}**  {d['description']}, "
@@ -623,8 +709,8 @@ def _build_stock_context(stock: dict) -> str:
     return "\n".join(lines)
 
 
-def _render_stock(stock: dict):
-    with st.container(border=True):
+def _render_stock(stock: dict, key: str = "live"):
+    with st.container(border=True, key=f"stock_{key}"):
         st.markdown(f"📈 **{stock['name']}** ({stock['ticker']})")
         cols = st.columns(4)
         change_label = None
@@ -694,8 +780,8 @@ def _build_search_context(results):
     return "\n".join(lines)
 
 
-def _render_sources(sources):
-    with st.expander(f"🔎 참고한 웹 검색 결과 {len(sources)}건"):
+def _render_sources(sources, key: str = "live"):
+    with st.expander(f"🔎 참고한 웹 검색 결과 {len(sources)}건", key=f"sources_{key}"):
         for r in sources:
             title = r.get("title") or "(제목 없음)"
             href = r.get("href") or r.get("link") or r.get("url") or ""
@@ -775,15 +861,17 @@ messages = current_conv["messages"]
 
 client = OpenAI(base_url=LLM_BASE_URL, api_key="not-needed")
 
-for message in messages:
+for idx, message in enumerate(messages):
     with st.chat_message(message["role"]):
         if message.get("weather"):
-            _render_weather(message["weather"])
+            _render_weather(message["weather"], key=f"hist_{idx}")
         if message.get("stock"):
-            _render_stock(message["stock"])
+            _render_stock(message["stock"], key=f"hist_{idx}")
         st.markdown(message["content"])
         if message.get("sources"):
-            _render_sources(message["sources"])
+            _render_sources(message["sources"], key=f"hist_{idx}")
+        elif message.get("search_failed"):
+            st.warning("⚠️ 실시간 웹 검색에 실패했습니다 (검색 엔진 응답 없음). 이 답변은 실시간 정보 없이 생성된 것이니 사실 확인이 필요합니다.")
 
 user_input = st.chat_input("메시지를 입력하세요...")
 
@@ -798,20 +886,24 @@ if user_input:
     weather_info = None
     stock_info = None
     search_results = []
+    search_attempted = False
     if use_weather_api and _looks_like_weather_query(user_input):
         with st.spinner("🌤️ 날씨 조회 중..."):
             weather_info = _fetch_weather_for_query(user_input, default_weather_location)
         if not weather_info and use_web_search:
             with st.spinner("🔎 웹에서 최신 정보를 검색하는 중..."):
+                search_attempted = True
                 search_results = _web_search(user_input)
     elif use_stock_api and _looks_like_stock_query(user_input):
         with st.spinner("📈 시세 조회 중..."):
             stock_info = _fetch_stock_for_query(user_input)
         if not stock_info and use_web_search:
             with st.spinner("🔎 웹에서 최신 정보를 검색하는 중..."):
+                search_attempted = True
                 search_results = _web_search(user_input)
     elif use_web_search:
         with st.spinner("🔎 웹에서 최신 정보를 검색하는 중..."):
+            search_attempted = True
             search_results = _web_search(user_input)
 
     history_for_request = [{"role": m["role"], "content": m["content"]} for m in messages]
@@ -822,6 +914,15 @@ if user_input:
         combined_system_prompt += "\n\n" + _build_stock_context(stock_info)
     if search_results:
         combined_system_prompt += "\n\n" + _build_search_context(search_results)
+    elif search_attempted:
+        # 검색을 시도했지만 결과가 없거나 실패한 경우, 이 사실을 명시적으로 알려서
+        # 모델이 "검색 결과를 바탕으로"라며 없는 정보를 지어내지 못하게 한다.
+        combined_system_prompt += (
+            "\n\n[실시간 웹 검색 결과]\n"
+            "이 질문에 대해 웹 검색을 시도했지만 결과를 찾지 못했다(검색 실패 또는 결과 없음).\n"
+            "검색 결과를 받은 것처럼 말하지 마라. 이 주제에 대해 확실히 아는 것이 없다면 "
+            "모른다고 솔직히 답하고, 절대로 사실이나 세부 정보를 지어내지 마라."
+        )
     request_messages = [{"role": "system", "content": combined_system_prompt}] + history_for_request
 
     with st.chat_message("assistant"):
@@ -831,11 +932,12 @@ if user_input:
             _render_stock(stock_info)
         if search_results:
             _render_sources(search_results)
+        elif search_attempted:
+            # 검색을 시도했지만 아무 결과도 못 얻은 경우. 모델이 "검색 결과를
+            # 바탕으로"라며 지어낼 수 있으니, 실패 사실 자체를 화면에도 명확히 남긴다
+            # (시스템 프롬프트 지시만으로는 이 로컬 모델이 종종 무시했다).
+            st.warning("⚠️ 실시간 웹 검색에 실패했습니다 (검색 엔진 응답 없음). 아래 답변은 실시간 정보 없이 생성된 것이니 사실 확인이 필요합니다.")
 
-        placeholder = st.empty()
-        buffer = ""
-        in_think = False
-        visible_response = ""
         try:
             stream = client.chat.completions.create(
                 model=LLM_MODEL,
@@ -846,40 +948,10 @@ if user_input:
                 stream=True,
                 extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
-            for chunk in stream:
-                if not chunk.choices:
-                    continue
-                delta = chunk.choices[0].delta
-                # 일부 서버는 추론 내용을 별도의 reasoning_content 필드로 보내므로 무시한다.
-                piece = getattr(delta, "content", None)
-                if not piece:
-                    continue
-                buffer += piece
-
-                # <think>...</think> 블록은 스트리밍 중에도 화면에 노출되지 않도록 걸러낸다.
-                while True:
-                    tag = "</think>" if in_think else "<think>"
-                    idx = buffer.find(tag)
-                    if idx != -1:
-                        if not in_think:
-                            visible_response += buffer[:idx]
-                        buffer = buffer[idx + len(tag):]
-                        in_think = not in_think
-                        continue
-
-                    # 태그가 청크 경계에서 잘렸을 수 있으니 안전한 부분까지만 흘려보낸다.
-                    partial = _partial_tag_len(buffer, tag)
-                    if not in_think:
-                        visible_response += buffer[: len(buffer) - partial]
-                    buffer = buffer[len(buffer) - partial:]
-                    break
-
-                placeholder.markdown(visible_response.strip() + "▌")
-            full_response = visible_response.strip()
-            placeholder.markdown(full_response)
+            full_response = st.write_stream(_stream_visible_chunks(stream)).strip()
         except Exception as e:
             full_response = f"오류가 발생했습니다: {e}"
-            placeholder.error(full_response)
+            st.error(full_response)
 
     assistant_message = {"role": "assistant", "content": full_response}
     if weather_info:
@@ -888,4 +960,6 @@ if user_input:
         assistant_message["stock"] = stock_info
     if search_results:
         assistant_message["sources"] = search_results
+    elif search_attempted:
+        assistant_message["search_failed"] = True
     messages.append(assistant_message)
