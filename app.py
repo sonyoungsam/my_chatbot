@@ -2,7 +2,7 @@ import json
 import re
 import time
 import uuid
-from collections import Counter
+from collections import Counter, deque
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -19,6 +19,7 @@ from openai import OpenAI
 LLM_BASE_URL = "http://192.168.0.201:18000/v1"
 EMBEDDING_BASE_URL = "http://192.168.0.201:18001/v1"
 EMBEDDING_MODEL = "dragonkue/bge-m3-ko"
+EMBEDDING_BATCH_SIZE = 64  # 큰 사이트는 청크가 1000개를 넘어가서 한 번에 보내면 서버 요청 제한에 걸릴 수 있음
 STREAM_UI_MIN_INTERVAL = 0.15  # 초. 화면 갱신 간격 최소치 (DOM 갱신이 너무 잦아 생기는 오류 방지)
 LLM_MODEL = "Qwen/Qwen3.6-35B-A3B-FP8"
 
@@ -29,7 +30,7 @@ DEFAULT_SYSTEM_PROMPT = """You are a helpful, honest assistant.
 - Only answer based on what is actually known or given in the conversation. Do not go off-topic or answer a question that was not asked.
 - If a question is ambiguous, ask a clarifying question instead of assuming.
 - Keep answers concise and directly relevant to the user's question.
-- You may be given a "크리스피드(CRESPEED) 공식 웹사이트 정보", "실시간 웹 검색 결과", "실시간 날씨 정보", or "실시간 주식 시세" context block. Use it when it helps answer the question, and mention the source briefly. Ignore it if it isn't relevant."""
+- You may be given a "(회사명) 공식 웹사이트 정보", "실시간 웹 검색 결과", "실시간 날씨 정보", or "실시간 주식 시세" context block. Use it when it helps answer the question, and mention the source briefly. Ignore it if it isn't relevant."""
 
 NEW_CHAT_TITLE = "새 대화"
 WEB_SEARCH_MAX_RESULTS = 5
@@ -52,16 +53,45 @@ DEFAULT_WEATHER_LOCATION = "Seoul"
 NOMINATIM_USER_AGENT = "my-first-chat-bot/1.0 (personal streamlit weather feature)"
 WEATHER_FORECAST_DAYS = 14  # Open-Meteo 무료 플랜은 최대 16일까지 지원
 
-# 크리스피드(CRESPEED) 공식 홈페이지 RAG. 이 회사에 대한 질문에는 일반 웹
-# 검색보다 회사 공식 사이트를 직접 크롤링한 내용을 우선 사용한다.
-CRESPEED_BASE_URL = "http://www.crespeed.com/2017/html/main.html"
-CRESPEED_DOMAIN = "www.crespeed.com"
-CRESPEED_MAX_PAGES = 45  # fnGnbLink() 메뉴까지 포함하면 실제 페이지가 40개 안팎이라 여유있게 잡음
-CRESPEED_KEYWORDS = ["크리스피드", "크레스피드", "crespeed"]
-CRESPEED_CACHE_PATH = Path(__file__).parent / ".crespeed_cache.json"
-CRESPEED_CACHE_MAX_AGE_DAYS = 7
-CRESPEED_CACHE_VERSION = 2  # 크롤러가 fnGnbLink() 메뉴를 놓치던 버그를 고치면서 올림. 옛 캐시 자동 무효화용
-CRESPEED_TOP_K = 6
+# 특정 회사 공식 홈페이지 RAG. 이 회사들에 대한 질문에는 일반 웹 검색보다
+# 공식 사이트를 직접 크롤링한 내용을 우선 사용한다. 새 회사를 추가하려면
+# 아래 딕셔너리에 항목만 추가하면 된다(코드 변경 불필요).
+SITE_RAG_CACHE_MAX_AGE_DAYS = 7
+SITE_RAG_CACHE_VERSION = 3  # 크롤러 로직을 바꿀 때마다 올려서 옛 캐시를 자동 무효화한다
+SITE_RAG_TOP_K = 6
+SITE_RAG_SKIP_EXTENSIONS = (
+    ".pdf", ".zip", ".jpg", ".jpeg", ".png", ".gif", ".mp4", ".mp3", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+)
+
+SITE_RAG_SITES = {
+    "crespeed": {
+        "label": "크리스피드",
+        "base_url": "http://www.crespeed.com/2017/html/main.html",
+        "domain": "www.crespeed.com",
+        "keywords": ["크리스피드", "크레스피드", "crespeed"],
+        "max_pages": 45,  # fnGnbLink() 메뉴까지 포함하면 실제 페이지가 40개 안팎이라 여유있게 잡음
+        "encoding": "euc-kr",  # 옛날 사이트라 apparent_encoding으로는 정확히 안 잡힘
+        "extra_link_pattern": r"fnGnbLink\('([^']+)'\)",  # <li onclick="javascript:fnGnbLink('URL')"> 메뉴 대응
+    },
+    "samsungsds": {
+        "label": "삼성SDS",
+        "base_url": "https://www.samsungsds.com/kr/index.html",
+        "domain": "www.samsungsds.com",
+        "keywords": ["삼성sds", "삼성 sds", "samsung sds", "samsungsds"],
+        "max_pages": 90,
+        "encoding": None,  # 정상적인 UTF-8 사이트라 자동 감지로 충분
+        "extra_link_pattern": None,
+        # 홈페이지 링크만 따라가면 회사소개/CEO/연혁 같은 핵심 페이지를
+        # 놓친다는 걸 직접 확인했다 — 이 대형 사이트는 상단 메뉴가
+        # 자바스크립트 메가메뉴라 서버 HTML에 링크가 없다("삼성SDS에 대해
+        # 설명해줘" 질문에 RAG가 약관/뉴스레터 페이지만 찾아온 원인). 대신
+        # sitemap.xml에서 전체 URL을 가져와 회사소개 경로를 우선순위로
+        # 크롤링한다. "/investor/"는 넣지 않는다 — 이사회 회의록 등 개별
+        # 게시글이 80개 넘게 걸려서 우선순위 예산을 다 잡아먹는 걸 확인했다.
+        "sitemap_url": "https://www.samsungsds.com/kr/sitemap.xml",
+        "priority_path_keywords": ["/company/", "/corporate/overview/"],
+    },
+}
 
 WEATHER_KEYWORDS = ["날씨", "기온", "체감온도", "강수", "비 와", "비와", "눈 와", "눈와", "우산", "습도", "풍속"]
 
@@ -353,37 +383,76 @@ def _web_search(query: str, max_results: int = WEB_SEARCH_MAX_RESULTS):
     return _ddgs_web_search(query, max_results=max_results)
 
 
-def _looks_like_crespeed_query(text: str) -> bool:
+def _site_rag_cache_path(site_key: str) -> Path:
+    return Path(__file__).parent / f".rag_cache_{site_key}.json"
+
+
+def _looks_like_site_rag_query(site_key: str, text: str) -> bool:
     lowered = text.lower()
-    return any(kw.lower() in lowered for kw in CRESPEED_KEYWORDS)
+    return any(kw.lower() in lowered for kw in SITE_RAG_SITES[site_key]["keywords"])
 
 
-def _crespeed_crawl():
-    """crespeed.com을 같은 도메인 내에서 얕게 크롤링한다.
+def _site_rag_seed_urls(config: dict):
+    """크롤링을 시작할 URL 목록을 만든다.
 
-    이 사이트는 옛날 방식의 frameset 구조라 실제 콘텐츠는 메인 프레임
-    페이지(CRESPEED_BASE_URL)에 있고, 인코딩도 EUC-KR이다.
-
-    상단 메뉴 중 "회사소개"(CEO인사말, 회사개요, 회사연혁 등) 하위 항목은
-    <a href>가 아니라 <li onclick="javascript:fnGnbLink('URL')">로 구현돼
-    있어서, <a href> 태그만 훑는 크롤러로는 이 섹션 전체(약 15페이지)를
-    통째로 놓친다는 걸 직접 확인했다("CEO 인사말 알려줘" 질문에 RAG가 엉뚱한
-    답을 한 원인). 그래서 fnGnbLink() 자바스크립트 호출도 정규식으로 함께
-    찾아 링크 큐에 추가한다. 홈페이지 링크를 따라가며 최대 CRESPEED_MAX_PAGES
-    페이지까지만 수집한다(무한 크롤링 방지).
+    큰 사이트는 홈페이지 링크만 따라가면 회사소개/투자자정보 같은 핵심
+    페이지를 놓칠 수 있다(자바스크립트 메가메뉴 등으로 홈페이지 HTML에
+    링크가 없는 경우) — samsungsds.com에서 실제로 겪은 문제로, 질문에
+    "삼성SDS에 대해 설명해줘"라고 하면 약관/뉴스레터 페이지만 찾아오고
+    회사소개 페이지는 아예 인덱스에 없었다. sitemap_url이 설정된 사이트는
+    사이트맵에서 전체 URL을 가져와 priority_path_keywords에 해당하는
+    경로(회사소개, 투자자정보 등)를 앞세운다. sitemap_url이 없으면 기존처럼
+    base_url 하나로 시작해 링크를 따라간다.
     """
+    sitemap_url = config.get("sitemap_url")
+    if not sitemap_url:
+        return [config["base_url"]]
+
+    try:
+        resp = requests.get(sitemap_url, headers={"User-Agent": NAVER_SEARCH_USER_AGENT}, timeout=10)
+        resp.raise_for_status()
+        urls = re.findall(r"<loc>(.*?)</loc>", resp.text)
+    except Exception:
+        return [config["base_url"]]
+
+    same_domain = [u for u in urls if urlparse(u).netloc == config["domain"]]
+    priority_keywords = config.get("priority_path_keywords") or []
+    priority_urls = [u for u in same_domain if any(kw in u for kw in priority_keywords)]
+    other_urls = [u for u in same_domain if u not in priority_urls]
+
+    seed, seen = [], set()
+    for u in [config["base_url"]] + priority_urls + other_urls:
+        if u not in seen:
+            seen.add(u)
+            seed.append(u)
+    return seed
+
+
+def _site_rag_crawl(site_key: str):
+    """설정된 회사 공식 사이트를 같은 도메인 내에서 얕게 크롤링한다.
+
+    사이트마다 인코딩이 다를 수 있고(예: crespeed.com은 EUC-KR), 일부
+    구식 사이트는 메뉴가 <a href>가 아니라 자바스크립트 함수 호출로
+    구현되어 있어(예: crespeed.com의 <li onclick="javascript:fnGnbLink(...)">)
+    일반 크롤러가 그 섹션을 통째로 놓친다 — "CEO 인사말 알려줘" 질문에서
+    실제로 겪은 문제다. 그래서 사이트별 extra_link_pattern 정규식으로
+    이런 링크도 함께 찾는다. 최대 max_pages 페이지까지만 수집한다.
+    """
+    config = SITE_RAG_SITES[site_key]
     headers = {"User-Agent": NAVER_SEARCH_USER_AGENT}
     visited = set()
-    queue = [CRESPEED_BASE_URL]
+    queue = deque(_site_rag_seed_urls(config))
+    queued = set(queue)  # queue의 O(1) 멤버십 체크용 (사이트맵이 크면 queue가 수천 개가 될 수 있음)
     pages = []
-    while queue and len(visited) < CRESPEED_MAX_PAGES:
-        url = queue.pop(0)
+    while queue and len(visited) < config["max_pages"]:
+        url = queue.popleft()
+        queued.discard(url)
         if url in visited:
             continue
         visited.add(url)
         try:
             resp = requests.get(url, headers=headers, timeout=8)
-            resp.encoding = "euc-kr"
+            resp.encoding = config["encoding"] or resp.apparent_encoding
             html = resp.text
         except Exception:
             continue
@@ -398,19 +467,23 @@ def _crespeed_crawl():
             pages.append({"url": url, "title": title, "lines": lines})
 
         candidate_hrefs = [a["href"].strip() for a in soup.find_all("a", href=True)]
-        candidate_hrefs += re.findall(r"fnGnbLink\('([^']+)'\)", html)
+        if config.get("extra_link_pattern"):
+            candidate_hrefs += re.findall(config["extra_link_pattern"], html)
 
         for href in candidate_hrefs:
             if not href or href.startswith(("javascript:", "#", "mailto:", "tel:")):
                 continue
+            if href.lower().split("?")[0].endswith(SITE_RAG_SKIP_EXTENSIONS):
+                continue
             full = urljoin(url, href).split("#")[0]
-            if urlparse(full).netloc == CRESPEED_DOMAIN and full not in visited and full not in queue:
+            if urlparse(full).netloc == config["domain"] and full not in visited and full not in queued:
                 queue.append(full)
+                queued.add(full)
 
     return pages
 
 
-def _crespeed_build_chunks(pages: list):
+def _site_rag_build_chunks(pages: list):
     """페이지들에서 반복되는 내비게이션/푸터 텍스트(보일러플레이트)를 제거하고 청크로 묶는다.
 
     모든 페이지에 공통으로 나오는 메뉴/주소 같은 줄은 대부분 절반 이상의
@@ -446,37 +519,44 @@ def _crespeed_build_chunks(pages: list):
 def _embed_texts(texts: list):
     """임베딩 서버(dragonkue/bge-m3-ko, OpenAI 호환)로 텍스트를 벡터로 변환한다.
 
-    메인 채팅용 LLM과 별도 서버(EMBEDDING_BASE_URL)를 쓴다. 실패하면 None을
-    반환한다.
+    메인 채팅용 LLM과 별도 서버(EMBEDDING_BASE_URL)를 쓴다. 삼성SDS처럼 큰
+    사이트는 청크가 1,000개를 넘어가서, 한 번에 다 보내면 서버의 요청
+    크기/토큰 제한에 걸릴 수 있어 EMBEDDING_BATCH_SIZE개씩 나눠 보낸다.
+    실패하면 None을 반환한다.
     """
     if not texts:
         return []
     try:
-        resp = embedding_client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
-        return [item.embedding for item in resp.data]
+        embeddings = []
+        for i in range(0, len(texts), EMBEDDING_BATCH_SIZE):
+            batch = texts[i:i + EMBEDDING_BATCH_SIZE]
+            resp = embedding_client.embeddings.create(model=EMBEDDING_MODEL, input=batch)
+            embeddings.extend(item.embedding for item in resp.data)
+        return embeddings
     except Exception:
         return None
 
 
-def _load_crespeed_cache():
+def _load_site_rag_cache(site_key: str):
+    cache_path = _site_rag_cache_path(site_key)
     try:
-        if CRESPEED_CACHE_PATH.exists():
-            age_seconds = time.time() - CRESPEED_CACHE_PATH.stat().st_mtime
-            if age_seconds < CRESPEED_CACHE_MAX_AGE_DAYS * 86400:
-                with open(CRESPEED_CACHE_PATH, encoding="utf-8") as f:
+        if cache_path.exists():
+            age_seconds = time.time() - cache_path.stat().st_mtime
+            if age_seconds < SITE_RAG_CACHE_MAX_AGE_DAYS * 86400:
+                with open(cache_path, encoding="utf-8") as f:
                     data = json.load(f)
-                if data.get("version") == CRESPEED_CACHE_VERSION:
+                if data.get("version") == SITE_RAG_CACHE_VERSION:
                     return data.get("chunks"), data.get("embeddings")
     except Exception:
         pass
     return None, None
 
 
-def _save_crespeed_cache(chunks: list, embeddings: list):
+def _save_site_rag_cache(site_key: str, chunks: list, embeddings: list):
     try:
-        with open(CRESPEED_CACHE_PATH, "w", encoding="utf-8") as f:
+        with open(_site_rag_cache_path(site_key), "w", encoding="utf-8") as f:
             json.dump(
-                {"version": CRESPEED_CACHE_VERSION, "chunks": chunks, "embeddings": embeddings},
+                {"version": SITE_RAG_CACHE_VERSION, "chunks": chunks, "embeddings": embeddings},
                 f,
                 ensure_ascii=False,
             )
@@ -485,19 +565,19 @@ def _save_crespeed_cache(chunks: list, embeddings: list):
 
 
 @st.cache_resource(show_spinner=False)
-def _load_crespeed_index(_cache_bust: float = 0.0):
-    """크리스피드 사이트 청크 + 임베딩을 (재)빌드하거나 디스크 캐시에서 불러온다.
+def _load_site_rag_index(site_key: str, _cache_bust: float = 0.0):
+    """사이트 청크 + 임베딩을 (재)빌드하거나 디스크 캐시에서 불러온다.
 
-    st.cache_resource로 감싸서 같은 서버 프로세스에서는 매 상호작용마다
-    다시 계산하지 않는다. _cache_bust 값을 바꾸면(예: 새로고침 버튼) 강제로
-    다시 빌드된다.
+    st.cache_resource로 감싸서(site_key별로 별도 캐시) 같은 서버 프로세스
+    에서는 매 상호작용마다 다시 계산하지 않는다. _cache_bust 값을 바꾸면
+    (예: 새로고침 버튼) 강제로 다시 빌드된다.
     """
-    chunks, embeddings = _load_crespeed_cache()
+    chunks, embeddings = _load_site_rag_cache(site_key)
     if chunks and embeddings:
         return chunks, np.array(embeddings)
 
-    pages = _crespeed_crawl()
-    chunks = _crespeed_build_chunks(pages)
+    pages = _site_rag_crawl(site_key)
+    chunks = _site_rag_build_chunks(pages)
     if not chunks:
         return [], None
 
@@ -505,12 +585,12 @@ def _load_crespeed_index(_cache_bust: float = 0.0):
     if not embeddings:
         return [], None
 
-    _save_crespeed_cache(chunks, embeddings)
+    _save_site_rag_cache(site_key, chunks, embeddings)
     return chunks, np.array(embeddings)
 
 
-def _crespeed_search(query: str, top_k: int = CRESPEED_TOP_K):
-    chunks, embeddings = _load_crespeed_index()
+def _site_rag_search(site_key: str, query: str, top_k: int = SITE_RAG_TOP_K):
+    chunks, embeddings = _load_site_rag_index(site_key)
     if not chunks or embeddings is None:
         return []
 
@@ -524,21 +604,24 @@ def _crespeed_search(query: str, top_k: int = CRESPEED_TOP_K):
     sims = d_norm @ q_norm
 
     ranked_idx = np.argsort(-sims)[:top_k]
+    label = SITE_RAG_SITES[site_key]["label"]
     results = []
     for i in ranked_idx:
         c = chunks[int(i)]
         results.append({
-            "title": f"크리스피드 공식 사이트 - {c['title']}",
+            "title": f"{label} 공식 사이트 - {c['title']}",
             "body": c["text"][:800],
             "href": c["url"],
         })
     return results
 
 
-def _build_crespeed_context(results: list) -> str:
+def _build_site_rag_context(site_key: str, results: list) -> str:
+    label = SITE_RAG_SITES[site_key]["label"]
+    domain = SITE_RAG_SITES[site_key]["domain"]
     lines = [
-        "[크리스피드(CRESPEED) 공식 웹사이트 정보]",
-        "아래는 크리스피드 공식 홈페이지(crespeed.com)를 직접 수집해 질문과 관련도가",
+        f"[{label} 공식 웹사이트 정보]",
+        f"아래는 {label} 공식 홈페이지({domain})를 직접 수집해 질문과 관련도가",
         "높은 순으로 뽑은 내용입니다. 일반 웹 검색 결과나 너의 사전 지식보다 이 내용을",
         "우선하라. 여기 없는 내용은 추측하지 말고 모른다고 답하라.",
         "",
@@ -1144,18 +1227,20 @@ with st.sidebar:
         value=True,
         help="'~주가/시세' 등이 포함된 질문에는 검색 대신 Yahoo Finance 실시간 시세를 가져옵니다. 국내(삼성전자 등)/해외(AAPL 등) 종목을 모두 지원하며, '추이/차트/1달간' 같은 표현이 있으면 기간별 추이 차트도 함께 보여줍니다.",
     )
-    use_crespeed_rag = st.checkbox(
-        "🏢 크리스피드 질문에 공식 사이트 RAG 사용",
-        value=True,
-        help="'크리스피드'가 포함된 질문에는 crespeed.com을 직접 크롤링해 임베딩 검색(dragonkue/bge-m3-ko)한 내용을 최우선으로 사용합니다.",
-    )
-    if st.button("🔄 크리스피드 사이트 다시 수집", use_container_width=True):
-        _load_crespeed_index.clear()
-        try:
-            CRESPEED_CACHE_PATH.unlink(missing_ok=True)
-        except Exception:
-            pass
-        st.toast("크리스피드 사이트 캐시를 지웠습니다. 다음 질문부터 새로 수집합니다.")
+    use_site_rag = {}
+    for site_key, site_config in SITE_RAG_SITES.items():
+        use_site_rag[site_key] = st.checkbox(
+            f"🏢 {site_config['label']} 질문에 공식 사이트 RAG 사용",
+            value=True,
+            help=f"'{site_config['label']}'가 포함된 질문에는 {site_config['domain']}을 직접 크롤링해 임베딩 검색(dragonkue/bge-m3-ko)한 내용을 최우선으로 사용합니다.",
+        )
+        if st.button(f"🔄 {site_config['label']} 사이트 다시 수집", key=f"refresh_rag_{site_key}", use_container_width=True):
+            _load_site_rag_index.clear()
+            try:
+                _site_rag_cache_path(site_key).unlink(missing_ok=True)
+            except Exception:
+                pass
+            st.toast(f"{site_config['label']} 사이트 캐시를 지웠습니다. 다음 질문부터 새로 수집합니다.")
 
     if st.button("🆕 새 대화", use_container_width=True):
         _new_conversation()
@@ -1187,8 +1272,14 @@ embedding_client = OpenAI(base_url=EMBEDDING_BASE_URL, api_key="not-needed")
 
 for idx, message in enumerate(messages):
     with st.chat_message(message["role"]):
-        if message.get("crespeed_sources"):
-            _render_sources(message["crespeed_sources"], key=f"hist_crespeed_{idx}", label="🏢 크리스피드 공식 사이트 참고")
+        if message.get("site_rag"):
+            site_rag_msg = message["site_rag"]
+            site_label = SITE_RAG_SITES[site_rag_msg["site_key"]]["label"]
+            _render_sources(
+                site_rag_msg["results"],
+                key=f"hist_site_rag_{idx}",
+                label=f"🏢 {site_label} 공식 사이트 참고",
+            )
         if message.get("weather"):
             _render_weather(message["weather"], key=f"hist_{idx}")
         if message.get("stock"):
@@ -1211,13 +1302,21 @@ if user_input:
 
     weather_info = None
     stock_info = None
-    crespeed_results = []
+    site_rag_key = None
+    site_rag_results = []
     search_results = []
     search_attempted = False
-    if use_crespeed_rag and _looks_like_crespeed_query(user_input):
-        with st.spinner("🏢 크리스피드 공식 사이트 조회 중..."):
-            crespeed_results = _crespeed_search(user_input)
-        if not crespeed_results and use_web_search:
+
+    matched_site_key = next(
+        (key for key in SITE_RAG_SITES if use_site_rag.get(key) and _looks_like_site_rag_query(key, user_input)),
+        None,
+    )
+    if matched_site_key:
+        site_rag_key = matched_site_key
+        site_label = SITE_RAG_SITES[matched_site_key]["label"]
+        with st.spinner(f"🏢 {site_label} 공식 사이트 조회 중..."):
+            site_rag_results = _site_rag_search(matched_site_key, user_input)
+        if not site_rag_results and use_web_search:
             with st.spinner("🔎 웹에서 최신 정보를 검색하는 중..."):
                 search_attempted = True
                 search_results = _web_search(user_input)
@@ -1242,8 +1341,8 @@ if user_input:
 
     history_for_request = [{"role": m["role"], "content": m["content"]} for m in messages]
     combined_system_prompt = system_prompt + "\n\n" + _today_note()
-    if crespeed_results:
-        combined_system_prompt += "\n\n" + _build_crespeed_context(crespeed_results)
+    if site_rag_results:
+        combined_system_prompt += "\n\n" + _build_site_rag_context(site_rag_key, site_rag_results)
     if weather_info:
         combined_system_prompt += "\n\n" + _build_weather_context(weather_info)
     if stock_info:
@@ -1262,8 +1361,9 @@ if user_input:
     request_messages = [{"role": "system", "content": combined_system_prompt}] + history_for_request
 
     with st.chat_message("assistant"):
-        if crespeed_results:
-            _render_sources(crespeed_results, label="🏢 크리스피드 공식 사이트 참고")
+        if site_rag_results:
+            site_label = SITE_RAG_SITES[site_rag_key]["label"]
+            _render_sources(site_rag_results, label=f"🏢 {site_label} 공식 사이트 참고")
         if weather_info:
             _render_weather(weather_info)
         if stock_info:
@@ -1292,8 +1392,8 @@ if user_input:
             st.error(full_response)
 
     assistant_message = {"role": "assistant", "content": full_response}
-    if crespeed_results:
-        assistant_message["crespeed_sources"] = crespeed_results
+    if site_rag_results:
+        assistant_message["site_rag"] = {"site_key": site_rag_key, "results": site_rag_results}
     if weather_info:
         assistant_message["weather"] = weather_info
     if stock_info:

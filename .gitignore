@@ -4,3 +4,4 @@ __pycache__/
 .streamlit/secrets.toml
 streamlit.log
 .crespeed_cache.json
+.rag_cache_*.json
