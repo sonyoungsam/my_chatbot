@@ -2,16 +2,23 @@ import json
 import re
 import time
 import uuid
+from collections import Counter
 from datetime import datetime
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
 
+import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 import yfinance as yf
+from bs4 import BeautifulSoup
 from ddgs import DDGS
 from openai import OpenAI
 
 LLM_BASE_URL = "http://192.168.0.201:18000/v1"
+EMBEDDING_BASE_URL = "http://192.168.0.201:18001/v1"
+EMBEDDING_MODEL = "dragonkue/bge-m3-ko"
 STREAM_UI_MIN_INTERVAL = 0.15  # 초. 화면 갱신 간격 최소치 (DOM 갱신이 너무 잦아 생기는 오류 방지)
 LLM_MODEL = "Qwen/Qwen3.6-35B-A3B-FP8"
 
@@ -22,7 +29,7 @@ DEFAULT_SYSTEM_PROMPT = """You are a helpful, honest assistant.
 - Only answer based on what is actually known or given in the conversation. Do not go off-topic or answer a question that was not asked.
 - If a question is ambiguous, ask a clarifying question instead of assuming.
 - Keep answers concise and directly relevant to the user's question.
-- You may be given a "실시간 웹 검색 결과", "실시간 날씨 정보", or "실시간 주식 시세" context block. Use it when it helps answer the question, and mention the source briefly. Ignore it if it isn't relevant."""
+- You may be given a "크리스피드(CRESPEED) 공식 웹사이트 정보", "실시간 웹 검색 결과", "실시간 날씨 정보", or "실시간 주식 시세" context block. Use it when it helps answer the question, and mention the source briefly. Ignore it if it isn't relevant."""
 
 NEW_CHAT_TITLE = "새 대화"
 WEB_SEARCH_MAX_RESULTS = 5
@@ -44,6 +51,17 @@ QUERY_CLEANUP_PATTERNS = [
 DEFAULT_WEATHER_LOCATION = "Seoul"
 NOMINATIM_USER_AGENT = "my-first-chat-bot/1.0 (personal streamlit weather feature)"
 WEATHER_FORECAST_DAYS = 14  # Open-Meteo 무료 플랜은 최대 16일까지 지원
+
+# 크리스피드(CRESPEED) 공식 홈페이지 RAG. 이 회사에 대한 질문에는 일반 웹
+# 검색보다 회사 공식 사이트를 직접 크롤링한 내용을 우선 사용한다.
+CRESPEED_BASE_URL = "http://www.crespeed.com/2017/html/main.html"
+CRESPEED_DOMAIN = "www.crespeed.com"
+CRESPEED_MAX_PAGES = 45  # fnGnbLink() 메뉴까지 포함하면 실제 페이지가 40개 안팎이라 여유있게 잡음
+CRESPEED_KEYWORDS = ["크리스피드", "크레스피드", "crespeed"]
+CRESPEED_CACHE_PATH = Path(__file__).parent / ".crespeed_cache.json"
+CRESPEED_CACHE_MAX_AGE_DAYS = 7
+CRESPEED_CACHE_VERSION = 2  # 크롤러가 fnGnbLink() 메뉴를 놓치던 버그를 고치면서 올림. 옛 캐시 자동 무효화용
+CRESPEED_TOP_K = 6
 
 WEATHER_KEYWORDS = ["날씨", "기온", "체감온도", "강수", "비 와", "비와", "눈 와", "눈와", "우산", "습도", "풍속"]
 
@@ -333,6 +351,201 @@ def _web_search(query: str, max_results: int = WEB_SEARCH_MAX_RESULTS):
     if naver_results:
         return naver_results
     return _ddgs_web_search(query, max_results=max_results)
+
+
+def _looks_like_crespeed_query(text: str) -> bool:
+    lowered = text.lower()
+    return any(kw.lower() in lowered for kw in CRESPEED_KEYWORDS)
+
+
+def _crespeed_crawl():
+    """crespeed.com을 같은 도메인 내에서 얕게 크롤링한다.
+
+    이 사이트는 옛날 방식의 frameset 구조라 실제 콘텐츠는 메인 프레임
+    페이지(CRESPEED_BASE_URL)에 있고, 인코딩도 EUC-KR이다.
+
+    상단 메뉴 중 "회사소개"(CEO인사말, 회사개요, 회사연혁 등) 하위 항목은
+    <a href>가 아니라 <li onclick="javascript:fnGnbLink('URL')">로 구현돼
+    있어서, <a href> 태그만 훑는 크롤러로는 이 섹션 전체(약 15페이지)를
+    통째로 놓친다는 걸 직접 확인했다("CEO 인사말 알려줘" 질문에 RAG가 엉뚱한
+    답을 한 원인). 그래서 fnGnbLink() 자바스크립트 호출도 정규식으로 함께
+    찾아 링크 큐에 추가한다. 홈페이지 링크를 따라가며 최대 CRESPEED_MAX_PAGES
+    페이지까지만 수집한다(무한 크롤링 방지).
+    """
+    headers = {"User-Agent": NAVER_SEARCH_USER_AGENT}
+    visited = set()
+    queue = [CRESPEED_BASE_URL]
+    pages = []
+    while queue and len(visited) < CRESPEED_MAX_PAGES:
+        url = queue.pop(0)
+        if url in visited:
+            continue
+        visited.add(url)
+        try:
+            resp = requests.get(url, headers=headers, timeout=8)
+            resp.encoding = "euc-kr"
+            html = resp.text
+        except Exception:
+            continue
+
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
+        text = soup.get_text(separator="\n")
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if lines:
+            title = lines[0]
+            pages.append({"url": url, "title": title, "lines": lines})
+
+        candidate_hrefs = [a["href"].strip() for a in soup.find_all("a", href=True)]
+        candidate_hrefs += re.findall(r"fnGnbLink\('([^']+)'\)", html)
+
+        for href in candidate_hrefs:
+            if not href or href.startswith(("javascript:", "#", "mailto:", "tel:")):
+                continue
+            full = urljoin(url, href).split("#")[0]
+            if urlparse(full).netloc == CRESPEED_DOMAIN and full not in visited and full not in queue:
+                queue.append(full)
+
+    return pages
+
+
+def _crespeed_build_chunks(pages: list):
+    """페이지들에서 반복되는 내비게이션/푸터 텍스트(보일러플레이트)를 제거하고 청크로 묶는다.
+
+    모든 페이지에 공통으로 나오는 메뉴/주소 같은 줄은 대부분 절반 이상의
+    페이지에서 그대로 반복되므로, 등장 빈도로 감지해서 제거한다(사이트별로
+    일일이 하드코딩하지 않아도 되게).
+    """
+    if not pages:
+        return []
+
+    line_counts = Counter()
+    for p in pages:
+        for line in set(p["lines"]):
+            line_counts[line] += 1
+    boilerplate_threshold = max(2, int(len(pages) * 0.5))
+    boilerplate = {line for line, cnt in line_counts.items() if cnt >= boilerplate_threshold}
+
+    chunks = []
+    for p in pages:
+        content_lines = [line for line in p["lines"] if line not in boilerplate]
+        buf, buf_len = [], 0
+        for line in content_lines:
+            buf.append(line)
+            buf_len += len(line)
+            if buf_len >= 500:
+                chunks.append({"url": p["url"], "title": buf[0], "text": "\n".join(buf)})
+                buf, buf_len = [], 0
+        if buf:
+            chunks.append({"url": p["url"], "title": buf[0], "text": "\n".join(buf)})
+
+    return [c for c in chunks if len(c["text"]) >= 20]
+
+
+def _embed_texts(texts: list):
+    """임베딩 서버(dragonkue/bge-m3-ko, OpenAI 호환)로 텍스트를 벡터로 변환한다.
+
+    메인 채팅용 LLM과 별도 서버(EMBEDDING_BASE_URL)를 쓴다. 실패하면 None을
+    반환한다.
+    """
+    if not texts:
+        return []
+    try:
+        resp = embedding_client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
+        return [item.embedding for item in resp.data]
+    except Exception:
+        return None
+
+
+def _load_crespeed_cache():
+    try:
+        if CRESPEED_CACHE_PATH.exists():
+            age_seconds = time.time() - CRESPEED_CACHE_PATH.stat().st_mtime
+            if age_seconds < CRESPEED_CACHE_MAX_AGE_DAYS * 86400:
+                with open(CRESPEED_CACHE_PATH, encoding="utf-8") as f:
+                    data = json.load(f)
+                if data.get("version") == CRESPEED_CACHE_VERSION:
+                    return data.get("chunks"), data.get("embeddings")
+    except Exception:
+        pass
+    return None, None
+
+
+def _save_crespeed_cache(chunks: list, embeddings: list):
+    try:
+        with open(CRESPEED_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(
+                {"version": CRESPEED_CACHE_VERSION, "chunks": chunks, "embeddings": embeddings},
+                f,
+                ensure_ascii=False,
+            )
+    except Exception:
+        pass
+
+
+@st.cache_resource(show_spinner=False)
+def _load_crespeed_index(_cache_bust: float = 0.0):
+    """크리스피드 사이트 청크 + 임베딩을 (재)빌드하거나 디스크 캐시에서 불러온다.
+
+    st.cache_resource로 감싸서 같은 서버 프로세스에서는 매 상호작용마다
+    다시 계산하지 않는다. _cache_bust 값을 바꾸면(예: 새로고침 버튼) 강제로
+    다시 빌드된다.
+    """
+    chunks, embeddings = _load_crespeed_cache()
+    if chunks and embeddings:
+        return chunks, np.array(embeddings)
+
+    pages = _crespeed_crawl()
+    chunks = _crespeed_build_chunks(pages)
+    if not chunks:
+        return [], None
+
+    embeddings = _embed_texts([c["text"] for c in chunks])
+    if not embeddings:
+        return [], None
+
+    _save_crespeed_cache(chunks, embeddings)
+    return chunks, np.array(embeddings)
+
+
+def _crespeed_search(query: str, top_k: int = CRESPEED_TOP_K):
+    chunks, embeddings = _load_crespeed_index()
+    if not chunks or embeddings is None:
+        return []
+
+    query_vec = _embed_texts([query])
+    if not query_vec:
+        return []
+
+    q = np.array(query_vec[0])
+    q_norm = q / (np.linalg.norm(q) + 1e-8)
+    d_norm = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-8)
+    sims = d_norm @ q_norm
+
+    ranked_idx = np.argsort(-sims)[:top_k]
+    results = []
+    for i in ranked_idx:
+        c = chunks[int(i)]
+        results.append({
+            "title": f"크리스피드 공식 사이트 - {c['title']}",
+            "body": c["text"][:800],
+            "href": c["url"],
+        })
+    return results
+
+
+def _build_crespeed_context(results: list) -> str:
+    lines = [
+        "[크리스피드(CRESPEED) 공식 웹사이트 정보]",
+        "아래는 크리스피드 공식 홈페이지(crespeed.com)를 직접 수집해 질문과 관련도가",
+        "높은 순으로 뽑은 내용입니다. 일반 웹 검색 결과나 너의 사전 지식보다 이 내용을",
+        "우선하라. 여기 없는 내용은 추측하지 말고 모른다고 답하라.",
+        "",
+    ]
+    for i, r in enumerate(results, 1):
+        lines.append(f"{i}. [{r['title']}]\n{r['body']}\n출처: {r['href']}\n")
+    return "\n".join(lines)
 
 
 def _looks_like_weather_query(text: str) -> bool:
@@ -878,8 +1091,8 @@ def _build_search_context(results):
     return "\n".join(lines)
 
 
-def _render_sources(sources, key: str = "live"):
-    with st.expander(f"🔎 참고한 웹 검색 결과 {len(sources)}건", key=f"sources_{key}"):
+def _render_sources(sources, key: str = "live", label: str = "🔎 참고한 웹 검색 결과"):
+    with st.expander(f"{label} {len(sources)}건", key=f"sources_{key}"):
         for r in sources:
             title = r.get("title") or "(제목 없음)"
             href = r.get("href") or r.get("link") or r.get("url") or ""
@@ -931,6 +1144,18 @@ with st.sidebar:
         value=True,
         help="'~주가/시세' 등이 포함된 질문에는 검색 대신 Yahoo Finance 실시간 시세를 가져옵니다. 국내(삼성전자 등)/해외(AAPL 등) 종목을 모두 지원하며, '추이/차트/1달간' 같은 표현이 있으면 기간별 추이 차트도 함께 보여줍니다.",
     )
+    use_crespeed_rag = st.checkbox(
+        "🏢 크리스피드 질문에 공식 사이트 RAG 사용",
+        value=True,
+        help="'크리스피드'가 포함된 질문에는 crespeed.com을 직접 크롤링해 임베딩 검색(dragonkue/bge-m3-ko)한 내용을 최우선으로 사용합니다.",
+    )
+    if st.button("🔄 크리스피드 사이트 다시 수집", use_container_width=True):
+        _load_crespeed_index.clear()
+        try:
+            CRESPEED_CACHE_PATH.unlink(missing_ok=True)
+        except Exception:
+            pass
+        st.toast("크리스피드 사이트 캐시를 지웠습니다. 다음 질문부터 새로 수집합니다.")
 
     if st.button("🆕 새 대화", use_container_width=True):
         _new_conversation()
@@ -958,9 +1183,12 @@ current_conv = st.session_state.conversations[st.session_state.current_id]
 messages = current_conv["messages"]
 
 client = OpenAI(base_url=LLM_BASE_URL, api_key="not-needed")
+embedding_client = OpenAI(base_url=EMBEDDING_BASE_URL, api_key="not-needed")
 
 for idx, message in enumerate(messages):
     with st.chat_message(message["role"]):
+        if message.get("crespeed_sources"):
+            _render_sources(message["crespeed_sources"], key=f"hist_crespeed_{idx}", label="🏢 크리스피드 공식 사이트 참고")
         if message.get("weather"):
             _render_weather(message["weather"], key=f"hist_{idx}")
         if message.get("stock"):
@@ -983,9 +1211,17 @@ if user_input:
 
     weather_info = None
     stock_info = None
+    crespeed_results = []
     search_results = []
     search_attempted = False
-    if use_weather_api and _looks_like_weather_query(user_input):
+    if use_crespeed_rag and _looks_like_crespeed_query(user_input):
+        with st.spinner("🏢 크리스피드 공식 사이트 조회 중..."):
+            crespeed_results = _crespeed_search(user_input)
+        if not crespeed_results and use_web_search:
+            with st.spinner("🔎 웹에서 최신 정보를 검색하는 중..."):
+                search_attempted = True
+                search_results = _web_search(user_input)
+    elif use_weather_api and _looks_like_weather_query(user_input):
         with st.spinner("🌤️ 날씨 조회 중..."):
             weather_info = _fetch_weather_for_query(user_input, default_weather_location)
         if not weather_info and use_web_search:
@@ -1006,6 +1242,8 @@ if user_input:
 
     history_for_request = [{"role": m["role"], "content": m["content"]} for m in messages]
     combined_system_prompt = system_prompt + "\n\n" + _today_note()
+    if crespeed_results:
+        combined_system_prompt += "\n\n" + _build_crespeed_context(crespeed_results)
     if weather_info:
         combined_system_prompt += "\n\n" + _build_weather_context(weather_info)
     if stock_info:
@@ -1024,6 +1262,8 @@ if user_input:
     request_messages = [{"role": "system", "content": combined_system_prompt}] + history_for_request
 
     with st.chat_message("assistant"):
+        if crespeed_results:
+            _render_sources(crespeed_results, label="🏢 크리스피드 공식 사이트 참고")
         if weather_info:
             _render_weather(weather_info)
         if stock_info:
@@ -1052,6 +1292,8 @@ if user_input:
             st.error(full_response)
 
     assistant_message = {"role": "assistant", "content": full_response}
+    if crespeed_results:
+        assistant_message["crespeed_sources"] = crespeed_results
     if weather_info:
         assistant_message["weather"] = weather_info
     if stock_info:
